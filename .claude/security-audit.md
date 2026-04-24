@@ -131,9 +131,55 @@ run: npm version "${GITHUB_REF_NAME#node-sdk/v}" --allow-same-version --no-git-t
 
 ---
 
+### Cross-check: zizmor v1.24.1 (auditor persona, `--collect=all`)
+
+Ran `zizmor --persona=auditor --collect=all .github/`. **25 findings** across 8 rules: 8 high / 10 medium / 4 low / 3 informational.
+
+**Confirmations (zizmor corroborates my findings):**
+
+| Manual | zizmor rule | Count | Verdict |
+|---|---|---|---|
+| F1 (excessive permissions) | `excessive-permissions` | 5 | **Confirmed & expanded**: zizmor flags *every* workflow-level write permission (not only the redundant `contents: write` on node-sdk). All should be moved to job-level so they're not inherited by any future sibling job. |
+| F2 (no environment gating) | `secrets-outside-env` | 3 | **Confirmed**: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `GO_RELEASER_GITHUB_TOKEN` all accessed outside a dedicated environment. |
+| F3 (no concurrency) | `concurrency-limits` | 3 | **Confirmed** on all three workflows (I had only flagged release; CI is efficiency-only). |
+| F4 (unquoted `GITHUB_REF_NAME`) | — | 0 | **Not in zizmor's scope** (its template-injection audit only covers `${{ }}`, not shell parameter expansion). Finding stands as defense-in-depth. |
+| F5 (`npm install` vs `npm ci`) | — | 0 | **Not in zizmor's scope**. Finding stands as a supply-chain concern. |
+
+**New findings from zizmor that I missed:**
+
+**F6 — Missing `cooldown:` on all Dependabot ecosystems** (medium, supply-chain)
+
+`.github/dependabot.yml` has no `cooldown:` block on any of the three ecosystems (gomod, npm, github-actions). Without cooldown, a freshly published malicious version could land in an auto-generated Dependabot PR within hours of upload, before public discovery. Cooldown (e.g., 7 days for patch, 14 for minor) is a cheap supply-chain mitigation.
+
+**Recommendation:** add a `cooldown:` block per ecosystem — example:
+```yaml
+cooldown:
+  default-days: 7
+  semver-major-days: 14
+```
+
+**F7 — Cache poisoning risk on release workflows** (low, supply-chain)
+
+`release.yml:26` (`setup-go`) and `release.yml:31`, `release-node-sdk.yml:27` (`setup-node` with explicit `cache: npm`) enable language caches. Caches populated by `pull_request` / `push: main` runs (untrusted or less-reviewed code) can be restored inside release jobs if keys overlap. For Go, the module cache is largely content-addressed (lower risk); for npm, the cache stores tarballs keyed on lockfile hash, so a different lockfile defends — but a cache-scope overlap between branches is still possible.
+
+**Recommendation:** either disable caching on release jobs (`cache: false` / explicit `GOMODCACHE` override), or confirm cache scope is release-only.
+
+**F8 — `actions/checkout` default `persist-credentials: true` (artipacked)** (low, informational)
+
+All four `actions/checkout` invocations (ci.yml x2, release.yml x1, release-node-sdk.yml x1) leave the default `persist-credentials: true`, which writes the `GITHUB_TOKEN` into `.git/config` on the runner. Exploitable only if later steps upload the workspace as an artifact or a malicious step reads `.git/config` — neither currently happens — but cheap to harden.
+
+**Recommendation:** set `with: persist-credentials: false` on every checkout (re-enable only where `git push` is needed, which is nowhere in these workflows).
+
+**Cosmetic zizmor findings — not tracked:**
+- `anonymous-definition` x3 (jobs missing `name:`) — style only.
+- `undocumented-permissions` x1 (`contents: write` missing comment on node-sdk) — moot after F1 fix.
+
+---
+
 ---
 
 ## Newly added tasks
 
 - [ ] Verify tag protection rules on `v*` and `node-sdk/v*.*.*` (repo setting — may need to ask user; cross-ref F2)
 - [ ] Audit the floating `version: "~> v2"` on goreleaser-action + `version: v2.11` on golangci-lint-action — consider pinning the tool binary too (low prio)
+- [ ] Consider adding zizmor to CI as a recurring check (uv tool install zizmor; run against `.github/`)
