@@ -42,9 +42,9 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 
 ## 4. Container & install supply chain
 
-- [ ] `Dockerfile` + `Dockerfile.goreleaser`: base images pinned by digest, non-root user, minimal final image
-- [ ] `install.sh`: HTTPS-only, checksum/signature verification, hardcoded release source
-- [ ] Release assets: `checksums.txt`, `.sig`, SBOM published and verified by `install.sh`
+- [x] `Dockerfile` + `Dockerfile.goreleaser`: base images pinned by digest, non-root user, minimal final image — `[!]` F14 (digest pinning)
+- [x] `install.sh`: HTTPS-only, checksum/signature verification, hardcoded release source — `[!]` see F20, F21, F24, F26
+- [x] Release assets: `checksums.txt`, `.sig`, SBOM published and verified by `install.sh` — `[!]` see F20, F25
 
 ## 5. Repo & org-level controls (best-effort from repo contents)
 
@@ -354,6 +354,118 @@ Both `web/package-lock.json` and `sdks/sdk-typescript/package-lock.json` include
 
 ---
 
+### Section 4 — Container & install supply chain
+
+**Positives (what's already right)**
+
+- `Dockerfile.goreleaser` is minimal: `alpine:3.21` + `ca-certificates` + the prebuilt binary + entrypoint. Runs as `agentvault` uid 65532 (non-root) with `USER agentvault`, `VOLUME /data` for persistence, and a `HEALTHCHECK` against the in-container `/health` endpoint.
+- `scripts/docker-entrypoint.sh` is a 1-line `exec` passthrough — no shell injection surface, no env-handling footguns.
+- `install.sh` uses `set -e`, HTTPS-only URLs (`https://api.github.com`, `https://github.com/.../releases/download`, `https://get.agent-vault.dev`), `curl -fsSL` (fail on HTTP error, silent, show errors, follow redirects), a cleanup `trap ... EXIT` to remove tmpdirs, and `maybe_sudo` that only escalates when `INSTALL_DIR` isn't already writable.
+- Installer backs up the SQLite DB (including `-wal` / `-shm`) before replacing the binary on upgrade — good operator hygiene.
+- Telemetry is off-by-default-friendly: documented at the top, opt-out via `AGENT_VAULT_NO_TELEMETRY=1`, payload is only OS/arch/version/event, fired with `-m 3` (3-second cap) and `|| true` so it can't block the install.
+- Only the proxy port (`14321`) is `EXPOSE`d; the MITM port (`14322`) is not declared — minor attack-surface reduction at the Docker level.
+
+---
+
+**F20 — `install.sh` does not verify checksums or signatures** (**high**, supply chain — single biggest install-path gap)
+
+The release pipeline produces `checksums.txt` (sha256 per archive) and `checksums.txt.bundle` (cosign keyless signature over the checksum file via OIDC) — see `.goreleaser.yml:38-53`. Both are published as GitHub Release assets. **`install.sh` downloads neither** and installs the binary directly after extracting the tarball (`install.sh:141-156`).
+
+Consequence: any adversary with one of the following footholds can ship a backdoored `agent-vault` to users:
+1. Compromise of `get.agent-vault.dev` (the script host). The script runs before any verification happens — it *is* the verifier.
+2. Compromise of the GitHub Release assets (Infisical org-member account takeover, or an unreviewed tag push per F2).
+3. Any future TLS-break / proxy / CDN misconfiguration.
+
+Given the project's purpose — a credential broker that will hold OAuth tokens, Stripe keys, encrypted CA material, etc. — this is the single most consequential finding in the audit. A compromised `agent-vault` binary is more valuable than the secrets it fronts.
+
+**Recommendation:** add mandatory checksum verification and optional (but documented) cosign verification:
+
+```sh
+# Download checksums + signature bundle alongside the archive
+curl -fSL -o "${TMP_DIR}/checksums.txt" \
+    "https://github.com/${REPO}/releases/download/v${LATEST}/checksums.txt"
+curl -fSL -o "${TMP_DIR}/checksums.txt.bundle" \
+    "https://github.com/${REPO}/releases/download/v${LATEST}/checksums.txt.bundle"
+
+# Verify sha256 — mandatory
+cd "$TMP_DIR"
+if command -v sha256sum >/dev/null; then
+    grep " ${ARCHIVE}$" checksums.txt | sha256sum -c - || error "Checksum verification failed"
+elif command -v shasum >/dev/null; then
+    grep " ${ARCHIVE}$" checksums.txt | shasum -a 256 -c - || error "Checksum verification failed"
+else
+    error "Neither sha256sum nor shasum available; cannot verify download integrity"
+fi
+
+# Verify cosign signature if cosign is installed — strongly encouraged
+if command -v cosign >/dev/null; then
+    cosign verify-blob \
+        --bundle checksums.txt.bundle \
+        --certificate-identity "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/v${LATEST}" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        checksums.txt || error "Cosign signature verification failed"
+fi
+```
+
+Cross-refs F9 (image signing — same class of gap on the Docker side) and F13 (`--certificate-identity` regex should be tightened when this lands).
+
+**F21 — JSON parsing of GitHub API response via `grep | sed`** (medium, robustness)
+
+`install.sh:124-125`:
+```sh
+LATEST="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name":[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/')"
+```
+Regex-parsing JSON is fragile — a future API response adding `tag_name` somewhere else (e.g., in `author.login` for an author named "tag_name"), or changing whitespace/escaping, silently produces an incorrect version string. More concerning for security: if the response is ever partially served (truncated, JSON injection via upstream misconfig), the extracted string could be influenced by an attacker and then embedded into a URL (`install.sh:136`) without validation.
+
+**Recommendation:** validate that `LATEST` matches a strict semver regex before using it in URL construction:
+```sh
+case "$LATEST" in
+    [0-9]*.[0-9]*.[0-9]*) : ;;
+    *) error "Unexpected version format: ${LATEST}" ;;
+esac
+```
+Or use `jq` if present with a `python3 -c "import json; print(json.load(...)['tag_name'])"` fallback.
+
+**F22 — Anonymous GitHub API rate limit** (low, reliability not security)
+
+The unauthenticated `api.github.com` call uses the 60-req/hour-per-IP limit. Users behind shared egress (NAT, corporate proxies, some CI runners) can hit 429. Consider falling back to parsing `https://github.com/${REPO}/releases/latest` (redirects to the tag page) via `Location:` header, which doesn't consume the API quota.
+
+**F23 — Telemetry beacon fires even if the binary is broken** (low)
+
+`install.sh:160-167,188-194` — the `agent-vault version` check runs *after* `maybe_sudo mv`, but the telemetry beacon fires regardless of whether verification (once F20 is implemented) would have failed. Order the flow as: download → verify → install → verify-runs → beacon. That way, a compromised tarball that passes checksum but fails to execute doesn't get reported as a successful install.
+
+**F24 — `get.agent-vault.dev` is the install-path root of trust** (informational, out-of-repo)
+
+The README and `install.sh:5` recommend `curl -fsSL https://get.agent-vault.dev | sh`. That domain is now a first-class piece of release infrastructure: whoever controls it can replace the script with anything, bypassing every other control in this audit. Can't verify from the repo, but worth confirming:
+
+- DNSSEC enabled on `agent-vault.dev`, CAA record pinning the CA.
+- HSTS + `Strict-Transport-Security` with `preload` on `get.agent-vault.dev`.
+- Script is served from an immutable source — ideally a GitHub Pages / Cloudflare Workers deployment whose config is in this repo and reviewed via PR, not a mutable S3 bucket.
+- Consider serving `install.sh` over `ghcr.io` / raw.githubusercontent at a pinned commit, so the `curl | sh` surface is provably the in-repo file at a specific ref.
+- If the script ever changes at tag time, that change should itself be signed (or the tag protection rules from F2 cover it).
+
+**F25 — Installer doesn't fetch the SBOM** (informational)
+
+Goreleaser attaches a syft SBOM per archive (`.goreleaser.yml:42-43`), but `install.sh` doesn't download it or leave it on disk. Users who want to run their own SBOM audits (Vex, OSV lookup, etc.) have to manually grab it from the release page. Low-effort improvement: download `${ARCHIVE}.sbom.json` alongside and drop it next to the installed binary.
+
+**F26 — `curl` invocations don't enforce `--proto '=https'`** (low)
+
+All `curl` calls in `install.sh` use `-fsSL` without `--proto '=https' --proto-redir '=https'`. If GitHub's CDN ever served a redirect to a non-HTTPS mirror (historically has happened with CDN misconfigurations), `-L` would follow. Adding `--proto '=https' --proto-redir '=https'` is a single-line defence.
+
+**Recommendation:** update every `curl` in the script:
+```sh
+curl --proto '=https' --proto-redir '=https' -fsSL ...
+```
+
+**Dev-image (`Dockerfile`) notes:**
+
+- Cross-ref F14 for base-image digest pinning (`node:22-alpine`, `golang:1.25-alpine`, `alpine:3.21` ×2 — all floating).
+- The local `make docker` build passes `--build-arg BUILD_DATE=$(DATE)` where `DATE := $(shell date -u ...)`, so the dev image is *not* reproducible the way the goreleaser build is (which uses `mod_timestamp: {{.CommitTimestamp}}`). This is fine for local dev but worth a comment in the Makefile so someone doesn't mistake `make docker` for a release build.
+- `Dockerfile:21` latent bug (`COPY --from=frontend /internal/server/webdist ...` from a non-existent absolute path) already tracked under *Newly added tasks*.
+
+---
+
 ## Newly added tasks
 
 - [ ] Verify tag protection rules on `v*` and `node-sdk/v*.*.*` (repo setting — may need to ask user; cross-ref F2)
@@ -365,6 +477,9 @@ Both `web/package-lock.json` and `sdks/sdk-typescript/package-lock.json` include
 - [ ] Investigate `Dockerfile:21` — `COPY --from=frontend /internal/server/webdist ...` looks like it copies from an absolute path in the frontend stage that doesn't exist (WORKDIR is `/app`). Likely a latent build-correctness bug, out of scope for security but worth flagging separately.
 - [ ] Decide resolution for F17 `skills-lock.json` — either delete or wire up the integrity check in `make build`.
 - [ ] Once F15 lands, decide fail-threshold policy for vuln scanners (hard-fail on high/critical vs advisory comments on PRs).
+- [ ] Verify `agent-vault.dev` / `get.agent-vault.dev` infrastructure (F24): DNSSEC, CAA records, HSTS preload, source-of-truth for the served `install.sh` (ideally an in-repo file at a pinned commit, not a mutable bucket).
+- [ ] Once F20 lands, update README's install instructions to reflect the verification step + mention the optional cosign path.
+- [ ] Consider offering a verification-only mode (`install.sh --verify-only`) and a per-platform install via Homebrew / a signed `.pkg` for macOS / `apt` repo for Debian — as alternatives to `curl | sh` for security-conscious users.
 - [ ] Consider adding runner-level egress / install-time controls to workflows:
   - **StepSecurity Harden-Runner (Community tier)** — `step-security/harden-runner@<sha>` as the first step of every job. Monitors/restricts outbound network from the runner, detects compromised actions exfiltrating data, and records a runtime SBOM of all egress. Free for public repos. High signal for the supply-chain threat model here (credential broker with cosign keys + Docker Hub token on the runner).
   - **Socket Firewall Free (`sfw`)** — wrap `npm ci` / `npm install` steps (particularly in `release-node-sdk.yml` and the `web/` / `sdks/sdk-typescript/` installs in `ci.yml`) so malicious install-script behaviour from compromised transitive deps is blocked before reaching the network. Complements F18 (esbuild/fsevents postinstall binary fetches).
