@@ -42,6 +42,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 | F27 | medium | repo | Branch protection active upstream but bypassed by maintainer on own commits *(revised from high after off-sandbox probe)* |
 | F27a | medium | repo | No tag-protection ruleset upstream — `v*` / `node-sdk/v*.*.*` unprotected |
 | F27b | low | repo | Commit+tag signing not required (74% commits, 40% tags currently signed) |
+| F27c | medium | repo | Immutable releases not confirmed enabled — mitigates Trivy/tj-actions-class asset-swap attacks |
 | F28 | medium | repo | No CODEOWNERS file |
 | F29 | low | repo | No signed-commit / DCO enforcement |
 | F30 | medium | repo | `GO_RELEASER_GITHUB_TOKEN` likely a PAT with cross-repo scope |
@@ -92,7 +93,8 @@ Shai-Hulud and Axios both proceeded via compromised maintainer accounts → push
 | 11 | F28 | **[PR]** | Add `CODEOWNERS` covering workflows, release config, crypto/auth/oauth/session, embedded-trust paths (`cmd/skill_*.md`, `persistent_instructions_admin.txt`, email templates, SQL migrations, sandbox assets). Draft policy in F28 writeup. |
 | 12 | F2 | **[BOTH]** | PR adds `environment: release` to release workflows. Maintainer creates the environment with required reviewers + tag-pattern deployment restrictions, moves secrets to it. |
 | 13 | F27b | **[CONFIG]** | Add `required_signatures` rule to both branch and (new) tag rulesets. Upstream currently at 74% commit / 40% tag signing — encouraged but not enforced. Tag signing in particular matters for release provenance. |
-| 14 | F30 | **[CONFIG]** | Migrate `GO_RELEASER_GITHUB_TOKEN` from a personal PAT to a **GitHub App installation token** scoped to `Infisical/homebrew-get-cli` `contents:write` only. Shai-Hulud-class risk: a PAT on any maintainer's laptop is one `npm install` away from being exfiltrated. |
+| 14 | F27c | **[CONFIG]** | **Enable Immutable Releases** in repo settings → Releases. Single-checkbox config that directly mitigates the Trivy-class (March 2026) and tj-actions-class (March 2025) tag/asset mutation attacks. Complements F9 (cosign) by making the platform itself enforce immutability. |
+| 15 | F30 | **[CONFIG]** | Migrate `GO_RELEASER_GITHUB_TOKEN` from a personal PAT to a **GitHub App installation token** scoped to `Infisical/homebrew-get-cli` `contents:write` only. Shai-Hulud-class risk: a PAT on any maintainer's laptop is one `npm install` away from being exfiltrated. |
 
 ### Tier 3 — dependency supply chain (the Shai-Hulud / Axios ingress paths)
 
@@ -715,6 +717,25 @@ For a credential-broker project, tag signing in particular should be enforced: u
 
 **Recommendation:** add `{"type": "required_signatures"}` to the repo-local ruleset (applies to both `main` commits and to the tag ruleset from F27a once that's created). Maintainers will need to set up commit signing (`git config commit.gpgsign true` + YubiKey or similar) if they haven't already.
 
+**F27c — Immutable releases not confirmed enabled** (medium)
+
+GitHub's **Immutable Releases** feature (public in 2024, GA thereafter) prevents modification or deletion of release assets and the release tag after publication. Enabling it is a one-click repo setting and directly mitigates two of the most significant 2025-2026 supply-chain attacks:
+
+- **Trivy (March 2026)**: TeamPCP force-pushed malicious code to 75 of 76 existing version tags of `aquasecurity/trivy-action`. Immutable releases would have blocked the tag mutation.
+- **tj-actions/changed-files (March 2025)**: The malicious commit was added *under the existing tag ref* users had pinned. Immutable releases are specifically designed to prevent this.
+
+The upstream repo's immutable-release status isn't directly exposed in the public API response on every release object, but can be probed:
+```sh
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/releases/latest" | jq '{
+  tag_name,
+  immutable: (.immutable // "field absent in response"),
+  assets: [.assets[] | {name, created_at, updated_at, was_modified: (.updated_at != .created_at)}]
+}'
+```
+If `immutable: true` → enabled. If `immutable: false` → disabled. If absent → feature may not be enabled on this repo, or the API surfacing varies. `was_modified: true` on any asset is direct evidence mutability has been exercised at least once.
+
+**Recommendation (for upstream maintainers):** enable Immutable Releases in repo settings → General → Releases. Combined with F9 (cosign image signing) and F11 (SLSA build provenance), this makes the release artifact chain cryptographically + platform-enforced tamper-evident.
+
 **F28 — No CODEOWNERS** (medium)
 
 `find` for `CODEOWNERS` returns nothing. Without it, no path-specific mandatory reviewer exists — so a workflow tweak, a `.goreleaser.yml` edit, a `cmd/skill_*.md` rewrite, or a change under `internal/{crypto,ca,auth,oauth,session}` can be approved by any contributor with review rights. Given the project's trust model (credential broker, root-CA key material), some paths should require named security-competent reviewers.
@@ -988,7 +1009,17 @@ curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/pulls/<PR#>/revie
 ```
 PRs where `merged_by == user` (self-merge) and there are zero `APPROVED` reviews indicate no required-review policy.
 
-**9. Ruleset bypass actors** (admin-only, but worth noting it's what you *can't* see): who's allowed to skip the rules (emergency-push roles, apps, individual bypass grants) is only readable to repo admins via `/repos/{owner}/{repo}/rulesets/{id}` with full read. If the PR-review count returns `null` in step 3, that's because the ruleset detail is gated. However, **step 7 proves bypass-actor presence indirectly** without needing the admin endpoint: if a commit landed on `main` without an associated PR on a ruleset-protected branch, a bypass happened.
+**9. Immutable Releases status.** Probes whether the repo has GitHub's Immutable Releases feature enabled (prevents post-publication asset/tag mutation — mitigates Trivy/tj-actions attacks):
+```sh
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/releases/latest" | jq '{
+  tag_name,
+  immutable: (.immutable // "field absent"),
+  any_asset_modified_post_upload: ([.assets[] | select(.updated_at != .created_at)] | length > 0)
+}'
+```
+`immutable: true` = enabled. `any_asset_modified_post_upload: true` = mutability has been exercised at least once (the feature is off, or the release predates enabling it).
+
+**10. Ruleset bypass actors** (admin-only, but worth noting it's what you *can't* see): who's allowed to skip the rules (emergency-push roles, apps, individual bypass grants) is only readable to repo admins via `/repos/{owner}/{repo}/rulesets/{id}` with full read. If the PR-review count returns `null` in step 3, that's because the ruleset detail is gated. However, **step 7 proves bypass-actor presence indirectly** without needing the admin endpoint: if a commit landed on `main` without an associated PR on a ruleset-protected branch, a bypass happened.
 
 **What's truly admin-only:**
 - Full branch-protection config: `required_approving_review_count`, `dismiss_stale_reviews`, `require_code_owner_reviews`, lock branch, etc.
