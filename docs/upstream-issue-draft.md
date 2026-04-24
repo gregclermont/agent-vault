@@ -26,11 +26,11 @@ Before I send anything as PRs, I wanted to check which (if any) you'd welcome. E
 Ordered by (security impact ÷ diff size ÷ argument surface). Any subset that sounds useful to you is fine.
 
 1. **Dependabot cooldown** (`.github/dependabot.yml`, ~10 lines added across the 3 ecosystems) — directly addresses the Shai-Hulud-style auto-merge window. Catches freshly-published malicious versions before they land in auto-PRs.
-2. **`npm install` → `npm ci` in `release-node-sdk.yml`** (1 word change) — Axios-exact defence; the vector Axios itself used was a widened dep resolution at publish time.
+2. **`npm install` → `npm ci` in `release-node-sdk.yml`** (1 word change) — Axios-exact defense; the vector Axios itself used was a widened dep resolution at publish time.
 3. **Drop redundant `contents: write`** on the node-sdk publish workflow (1 line) — zizmor-flagged least-privilege fix; the publish job only needs `id-token: write` for OIDC.
 4. **`persist-credentials: false`** on `actions/checkout` (+4 lines across 4 checkouts) — another zizmor finding (artipacked). No `git push` happens in any workflow, so the `GITHUB_TOKEN` doesn't need to be left in `.git/config`.
-5. **`--proto '=https'`** on `install.sh` curl calls (~15 chars total) — defence-in-depth against HTTP redirect downgrade.
-6. **Pin Dockerfile base images by digest** (4 line-replacements across `Dockerfile` and `Dockerfile.goreleaser`) — tj-actions-class defence for `alpine:3.21`, `node:22-alpine`, `golang:1.25-alpine`. Pairs nicely with enabling Dependabot's `docker` ecosystem.
+5. **`--proto '=https'`** on `install.sh` curl calls (~15 chars total) — defense-in-depth against HTTP redirect downgrade.
+6. **Pin Dockerfile base images by digest** (4 line-replacements across `Dockerfile` and `Dockerfile.goreleaser`) — tj-actions-class defense for `alpine:3.21`, `node:22-alpine`, `golang:1.25-alpine`. Pairs nicely with enabling Dependabot's `docker` ecosystem.
 7. **`actions/attest-build-provenance` after GoReleaser** (~10 lines in `release.yml`) — enables `gh attestation verify agent-vault_*.tar.gz --repo Infisical/agent-vault` for users with zero extra tool install. Materially improves the user-side verification UX and sets up the cleaner `install.sh` verify path.
 8. **`docker_signs` block in `.goreleaser.yml`** (~8 lines) — cosign is already installed in the release workflow; it's currently only used to sign `checksums.txt`. Signing the Docker images themselves closes the container-install-path gap.
 

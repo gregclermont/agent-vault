@@ -135,7 +135,7 @@ Cheap, non-urgent, close out in a single PR each.
 | 34 | F12 | **[CONFIG]** | Enable tag immutability on Docker Hub for versioned tags `*-amd64`, `*-arm64`, `0.*`. Complements F9. |
 | 35 | F29 | **[PR]** | Optional DCO workflow / require signed commits in branch protection (ties to F27). |
 | 36 | F31 | **[BOTH]** | PR adds `zricethezav/gitleaks-action`. Maintainer enables GitHub native Secret Scanning + Push Protection. |
-| 37 | F34 defence | **[PR]** | Add CSP headers to admin UI responses (server-side edit, not a workflow change — logged here so the audit's priority list is complete). |
+| 37 | F34 defense | **[PR]** | Add CSP headers to admin UI responses (server-side edit, not a workflow change — logged here so the audit's priority list is complete). |
 | 38 | F22 | **[PR]** | Fallback for the 60-req/h anonymous GitHub API limit in `install.sh` (`https://github.com/.../releases/latest` redirect parse). |
 | 39 | F18 | — | Accept & document. Inherent to esbuild/fsevents; mitigated by Tier-3 item #19 (Socket Firewall). |
 | 40 | F32 | — | Covered by Tier-3 item #18 (Harden-Runner). Drop from open list once that lands. |
@@ -462,7 +462,7 @@ This matches *any* workflow in the org/repo whose identity URL contains that sub
 | Module | Purpose | Vendor |
 |---|---|---|
 | `charmbracelet/huh`, `lipgloss`, `bubbletea` (indirect) | Interactive TUI | Charm (reputable) |
-| `fatih/color` | Terminal colour | Long-established |
+| `fatih/color` | Terminal color | Long-established |
 | `jedib0t/go-pretty/v6` | Table rendering | Community-vetted |
 | `muesli/reflow` | Text wrapping | Charm-adjacent |
 | `spf13/cobra` | CLI framework | De facto standard |
@@ -634,7 +634,7 @@ Goreleaser attaches a syft SBOM per archive (`.goreleaser.yml:42-43`), but `inst
 
 **F26 — `curl` invocations don't enforce `--proto '=https'`** (low)
 
-All `curl` calls in `install.sh` use `-fsSL` without `--proto '=https' --proto-redir '=https'`. If GitHub's CDN ever served a redirect to a non-HTTPS mirror (historically has happened with CDN misconfigurations), `-L` would follow. Adding `--proto '=https' --proto-redir '=https'` is a single-line defence.
+All `curl` calls in `install.sh` use `-fsSL` without `--proto '=https' --proto-redir '=https'`. If GitHub's CDN ever served a redirect to a non-HTTPS mirror (historically has happened with CDN misconfigurations), `-L` would follow. Adding `--proto '=https' --proto-redir '=https'` is a single-line defense.
 
 **Recommendation:** update every `curl` in the script:
 ```sh
@@ -657,7 +657,7 @@ curl --proto '=https' --proto-redir '=https' -fsSL ...
 
 - `SECURITY.md` is present with a clear vuln-reporting channel (`security@infisical.com`) and the correct "don't open public issues" guidance.
 - `.github/pull_request_template.md` includes a **Security checklist** (no secrets, no unauth endpoints, input validation, OWASP top-10). Not enforced, but a good nudge during PR authoring.
-- `.gitignore` explicitly blocks common secret-file patterns: `.env`, `.env.*`, `*.key`, `*.pem`, `*.p12`, `*.pfx`, `credentials.json`, `secrets.yaml`. Defence-in-depth against accidental commits.
+- `.gitignore` explicitly blocks common secret-file patterns: `.env`, `.env.*`, `*.key`, `*.pem`, `*.p12`, `*.pfx`, `credentials.json`, `secrets.yaml`. Defense-in-depth against accidental commits.
 - Only four distinct secrets are referenced across all workflows: `GITHUB_TOKEN` (built-in), `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `GO_RELEASER_GITHUB_TOKEN`. No deploy keys, no SSH key references, no exotic cloud creds.
 
 ---
@@ -836,7 +836,7 @@ The admin UI handles session cookies, proposal review (which approves credential
 
 **Mitigation today:**
 - `web/` has Dependabot coverage (F16 would add `sdks/sdk-typescript` too).
-- CI builds the frontend (`npm ci && npm run build`) — catches build-time errors but not malicious behaviour.
+- CI builds the frontend (`npm ci && npm run build`) — catches build-time errors but not malicious behavior.
 
 **Recommendation (layered):**
 - **CODEOWNERS** on `web/` (covered by F28).
@@ -887,7 +887,7 @@ Post-audit probe of publicly-observable release artifacts. Sandbox egress is res
 
 **Verdict:** the published registry empirically confirms F9 (no image signing) and F10 (no image SBOM attached). Not speculation — it's the observable state of all 10 shipped versions.
 
-Also: `:latest` IS being published and overwritten per release (confirms F12's description of the mutable-by-design behaviour).
+Also: `:latest` IS being published and overwritten per release (confirms F12's description of the mutable-by-design behavior).
 
 **`agent-vault.dev` / `get.agent-vault.dev` — fully verified off-sandbox**
 
@@ -905,7 +905,7 @@ Off-sandbox probe (after allowlisting the domain from the user's NRD-blocking re
 
 - **F24a (positive)** — HSTS preload is active. Covers browser traffic.
 - **F24b (info)** — Domain is <1 month old; NRD filters block `curl | sh` in enterprise networks.
-- **F24c (new, medium)** — **DNSSEC not enabled on `agent-vault.dev`.** For an install-path domain that's the root of trust for `curl | sh`, an unsigned zone means DNS-layer redirection attacks (nameserver compromise, registrar account takeover, cache poisoning against non-validating resolvers, BGP hijack + fake NS response) have no cryptographic defence. Recommend enabling DNSSEC signing on the zone (Cloudflare offers this as a one-click feature) and filing a DS record with the `dev.` registry.
+- **F24c (new, medium)** — **DNSSEC not enabled on `agent-vault.dev`.** For an install-path domain that's the root of trust for `curl | sh`, an unsigned zone means DNS-layer redirection attacks (nameserver compromise, registrar account takeover, cache poisoning against non-validating resolvers, BGP hijack + fake NS response) have no cryptographic defense. Recommend enabling DNSSEC signing on the zone (Cloudflare offers this as a one-click feature) and filing a DS record with the `dev.` registry.
 - **F24d (new, medium)** — **No CAA records.** A single CA compromise → valid cert for `agent-vault.dev` → combined with DNS redirection (F24c), full MITM on the installer.
 
   Cert inspection shows current issuer = **Google Trust Services WE1** (CAA identifier `pki.goog`), 90-day lease, likely issued via Cloudflare ACM. Because Cloudflare rotates between Google Trust Services and Let's Encrypt, pinning only the current issuer would eventually break auto-renewal. Recommended policy allows both:
@@ -1051,9 +1051,9 @@ If the user running the runbook finds `"protected": false` + direct-push commits
 - [ ] Once F20 lands, update README's install instructions to reflect the verification step + mention the optional cosign path.
 - [ ] Consider offering a verification-only mode (`install.sh --verify-only`) and a per-platform install via Homebrew / a signed `.pkg` for macOS / `apt` repo for Debian — as alternatives to `curl | sh` for security-conscious users.
 - [ ] Verify **upstream** `Infisical/agent-vault` branch + tag protection settings (F27 is phrased against the `gregclermont/agent-vault` mirror that this session has MCP access to). Re-check on upstream before treating F27 as actionable.
-- [ ] Add Content-Security-Policy headers to the admin UI response (F34 defence-in-depth). Out of scope for workflow-audit but logged here so it isn't lost.
+- [ ] Add Content-Security-Policy headers to the admin UI response (F34 defense-in-depth). Out of scope for workflow-audit but logged here so it isn't lost.
 - [ ] Review `internal/store/migrations/*.sql` review discipline: migrations run with DB privs on every upgrade (F35). Consider signed migrations or a migration-review CODEOWNERS entry.
 - [ ] Consider adding runner-level egress / install-time controls to workflows:
   - **StepSecurity Harden-Runner (Community tier)** — `step-security/harden-runner@<sha>` as the first step of every job. Monitors/restricts outbound network from the runner, detects compromised actions exfiltrating data, and records a runtime SBOM of all egress. Free for public repos. High signal for the supply-chain threat model here (credential broker with cosign keys + Docker Hub token on the runner).
-  - **Socket Firewall Free (`sfw`)** — wrap `npm ci` / `npm install` steps (particularly in `release-node-sdk.yml` and the `web/` / `sdks/sdk-typescript/` installs in `ci.yml`) so malicious install-script behaviour from compromised transitive deps is blocked before reaching the network. Complements F18 (esbuild/fsevents postinstall binary fetches).
+  - **Socket Firewall Free (`sfw`)** — wrap `npm ci` / `npm install` steps (particularly in `release-node-sdk.yml` and the `web/` / `sdks/sdk-typescript/` installs in `ci.yml`) so malicious install-script behavior from compromised transitive deps is blocked before reaching the network. Complements F18 (esbuild/fsevents postinstall binary fetches).
   Either one alone is useful; together they cover both runner egress and package-install egress. Evaluate cost (added runtime, potential flakes) before rolling out — start with release workflows where the blast radius is highest.
