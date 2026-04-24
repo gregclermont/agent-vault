@@ -715,13 +715,19 @@ Off-sandbox probe (after allowlisting the domain from the user's NRD-blocking re
 - **F24a (positive)** — HSTS preload is active. Covers browser traffic.
 - **F24b (info)** — Domain is <1 month old; NRD filters block `curl | sh` in enterprise networks.
 - **F24c (new, medium)** — **DNSSEC not enabled on `agent-vault.dev`.** For an install-path domain that's the root of trust for `curl | sh`, an unsigned zone means DNS-layer redirection attacks (nameserver compromise, registrar account takeover, cache poisoning against non-validating resolvers, BGP hijack + fake NS response) have no cryptographic defence. Recommend enabling DNSSEC signing on the zone (Cloudflare offers this as a one-click feature) and filing a DS record with the `dev.` registry.
-- **F24d (new, medium)** — **No CAA records.** A single CA compromise → valid cert for `agent-vault.dev` → combined with DNS redirection (F24c), full MITM on the installer. Recommend adding CAA pinning the specific CA currently in use. Minimal example:
+- **F24d (new, medium)** — **No CAA records.** A single CA compromise → valid cert for `agent-vault.dev` → combined with DNS redirection (F24c), full MITM on the installer.
+
+  Cert inspection shows current issuer = **Google Trust Services WE1** (CAA identifier `pki.goog`), 90-day lease, likely issued via Cloudflare ACM. Because Cloudflare rotates between Google Trust Services and Let's Encrypt, pinning only the current issuer would eventually break auto-renewal. Recommended policy allows both:
   ```
-  agent-vault.dev.   IN  CAA  0 issue "letsencrypt.org"
+  agent-vault.dev.   IN  CAA  0 issue     "pki.goog"
+  agent-vault.dev.   IN  CAA  0 issue     "letsencrypt.org"
+  agent-vault.dev.   IN  CAA  0 issuewild "pki.goog"
   agent-vault.dev.   IN  CAA  0 issuewild "letsencrypt.org"
-  agent-vault.dev.   IN  CAA  0 iodef "mailto:security@infisical.com"
+  agent-vault.dev.   IN  CAA  0 iodef     "mailto:security@infisical.com"
   ```
-  (Replace `letsencrypt.org` with whichever CA currently issues — verify with `openssl s_client -connect get.agent-vault.dev:443 -servername get.agent-vault.dev </dev/null 2>/dev/null | openssl x509 -noout -issuer`.)
+  Any stricter policy than this risks renewal failure the next time Cloudflare rotates the issuer. If you want to lock harder, either (a) pin to `pki.goog` only and commit to Cloudflare's current selection (and monitor renewals), or (b) use Cloudflare Custom Certificates with your own ACM.
+
+  Cert also covers a depth-2 wildcard `*.get.agent-vault.dev`, which is only issuable if the `issuewild` entries are present — hence both `issue` and `issuewild` in the recommended policy.
 - **F24e (new, low)** — **No runtime `Strict-Transport-Security` header** on `https://get.agent-vault.dev/`. Preload covers browsers so no downgrade window exists for them, and `curl | sh` installers don't consult HSTS anyway. But: Chrome's preload listing policy requires preloaded hosts to continue serving a valid STS header (`max-age ≥ 31536000; includeSubDomains; preload`); missing the header is a compliance violation and Chrome can drop domains that stop sending it. Add the header in the Cloudflare page rule / Workers response.
 - **F24f (new, info)** — **No other security response headers** (no `X-Content-Type-Options: nosniff`, no CSP, no `X-Frame-Options`). Low practical impact for a shell-script endpoint but trivial to add via Cloudflare transform rules.
 - **F24g (new, info)** — **Install script is served from Cloudflare edge.** Whoever holds the Cloudflare account for the `agent-vault.dev` zone can replace the served `install.sh` without going through the GitHub repo. Cloudflare account hygiene (hardware-key 2FA, audit log review, minimum-access seat roles) is now part of the install-path TCB. Verify:
@@ -746,7 +752,7 @@ openssl s_client -connect get.agent-vault.dev:443 -servername get.agent-vault.de
 - [ ] Investigate `Dockerfile:21` — `COPY --from=frontend /internal/server/webdist ...` looks like it copies from an absolute path in the frontend stage that doesn't exist (WORKDIR is `/app`). Likely a latent build-correctness bug, out of scope for security but worth flagging separately.
 - [ ] Decide resolution for F17 `skills-lock.json` — either delete or wire up the integrity check in `make build`.
 - [ ] Once F15 lands, decide fail-threshold policy for vuln scanners (hard-fail on high/critical vs advisory comments on PRs).
-- [x] Verify `agent-vault.dev` / `get.agent-vault.dev` infrastructure (F24). **Done via off-sandbox probe.** Split into 7 sub-findings (F24a-g): F24a HSTS preload active (positive), F24b NRD window (info), F24c DNSSEC disabled (medium), F24d no CAA records (medium), F24e no runtime STS header (low, preload-policy compliance), F24f no other security response headers (info), F24g install.sh served from Cloudflare edge → Cloudflare account is now TCB (info). Only remaining probe: confirm cert issuer for F24d's CAA policy — `openssl s_client ... | openssl x509 -issuer`.
+- [x] Verify `agent-vault.dev` / `get.agent-vault.dev` infrastructure (F24). **Done via off-sandbox probe.** Split into 7 sub-findings (F24a-g): F24a HSTS preload active (positive), F24b NRD window (info), F24c DNSSEC disabled (medium), F24d no CAA records (medium — cert issuer confirmed as Google Trust Services via Cloudflare; concrete CAA policy in F24d writeup), F24e no runtime STS header (low, preload-policy compliance), F24f no other security response headers (info), F24g install.sh served from Cloudflare edge → Cloudflare account is now TCB (info).
 - [ ] **F24b** — `agent-vault.dev` is a Newly-Registered Domain (<1 month old as of 2026-04-24). Corporate NRD-blocking resolvers will block `curl | sh` installs for 30-90 days. Offer a non-curl-pipe alternative (pairs with the "signed install alternatives" follow-up).
 - [ ] **F24c** — Enable DNSSEC on the `agent-vault.dev` zone (Cloudflare one-click) + file DS at registrar.
 - [ ] **F24d** — Add CAA records pinning the current issuer (verify with `openssl s_client` before committing the record).
