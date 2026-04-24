@@ -656,21 +656,36 @@ curl --proto '=https' --proto-redir '=https' -fsSL ...
 
 ---
 
-**F27 — `main` branch is not protected** (**high**)
+**F27 — `main` branch protection gaps (observable without admin access)** (**high**)
 
-`mcp__github__list_branches` on `gregclermont/agent-vault` returns `"protected": false` for both `main` and the audit branch. Taken at face value, this means:
-- Direct pushes to `main` are allowed (no required PR review).
-- No required CI status checks before merge.
-- Force-push to `main` is permitted.
-- Anyone with push access can ship arbitrary code that will then be picked up by the release pipeline on the next tag.
+`mcp__github__list_branches` on `gregclermont/agent-vault` returns `"protected": false` for both `main` and the audit branch. That's the boolean from the public branches endpoint — available to any anonymous caller on a public repo.
 
-**This is the upstream mitigation for half the findings in this audit** — F2 (release environment gating), F20 (installer verification), F33/F34 (tamper paths into embedded content) all rely on "merges to main are reviewed." Without branch protection, those controls degrade to "anyone on the commit bit can bypass everything."
+Going one level deeper, `mcp__github__list_commits` on `main` reveals the actual merge discipline:
 
-**Recommendation (to confirm on upstream `Infisical/agent-vault`):**
+| # | sha | author | committer.login | Pattern |
+|---|---|---|---|---|
+| 1 | `fdf011e` | Tuan Dang | `dangtony98` | **direct push** — committer is the author, not `web-flow` |
+| 2 | `c5df043` | Tuan Dang | `dangtony98` | **direct push** |
+| 3 | `2b8e020` | BlackMagiq | `web-flow` | PR merge (#103) — `web-flow` committer signature |
+| 4 | `c8b6461` | BlackMagiq | `web-flow` | PR merge (#102) |
+| 5 | `5f3e36f` | Chris | `web-flow` | PR merge (#101) |
+
+The top two commits on `main` have `committer.login = <human>` rather than `web-flow` (id `19864447`, the GitHub UI merge agent). That's the fingerprint of `git push origin main` — the commits never went through a PR.
+
+**What this directly proves:**
+- Direct pushes to `main` are allowed and occurring (2/5 recent commits).
+- No required PR review gate.
+- (Force-push enablement is harder to confirm from outside — admin-only via `/branches/{branch}/protection` — but "no branch protection" almost always means force-push is on.)
+
+**Upstream implication:** the mirror presumably reflects upstream state, so the pattern is likely the same on `Infisical/agent-vault`. The user should re-run the two commands in the runbook below against upstream to confirm.
+
+**Why this matters:** this is the mitigation that half the findings in this audit depend on. F2 (release environment gating), F20 (installer verification), F33/F34 (tamper paths into embedded content) all rely on "merges to `main` are reviewed." Without branch protection, those controls degrade to "anyone on the commit bit can bypass everything." Shai-Hulud-class attacks *specifically* rely on the absence of branch protection — a maintainer account compromise straight-lines into an unreviewed push.
+
+**Recommendation (for upstream maintainers):**
 - Require at least 1 review (ideally 2 for release-touching paths — see F28).
 - Require status checks: `test`, `lint`, the planned zizmor + vuln-scan jobs from F15.
 - Disallow force-push and deletion.
-- Enforce linear history (no merge commits that bypass required checks via rebase races).
+- Enforce linear history.
 - Enable **tag protection rules** for `v*` and `node-sdk/v*.*.*` so only admins can create release tags (cross-ref F2).
 
 **F28 — No CODEOWNERS** (medium)
@@ -868,6 +883,83 @@ Re-checking cert issuer for F24d remains one small open item:
 openssl s_client -connect get.agent-vault.dev:443 -servername get.agent-vault.dev </dev/null 2>/dev/null \
   | openssl x509 -noout -issuer -subject -dates -ext subjectAltName
 ```
+
+---
+
+### Auditing branch + tag protection on any GitHub repo (without admin access)
+
+Full branch-protection config (`/branches/{branch}/protection`) is admin-only. But enough is exposed to public callers to audit the *effective* protection posture. Commands below work against **any public repo** with just `curl` + `jq` + an optional unscoped `GITHUB_TOKEN` (classic `gh auth token` or a no-scope fine-grained PAT is enough; it only serves to raise the 60-req/h anonymous rate limit to 5000/h).
+
+Set up:
+```sh
+OWNER=Infisical
+REPO=agent-vault
+H=(-H "Accept: application/vnd.github+json")
+[ -n "$GITHUB_TOKEN" ] && H+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+```
+
+**1. Is branch protection enabled at all?**
+```sh
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/branches/main" | jq '{name, protected, protection_url}'
+```
+Returns `{"protected": true/false}` publicly. Baseline signal.
+
+**2. What rules apply to `main`?** (works without admin — returns the *effective* ruleset)
+```sh
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/rules/branches/main" | jq '[.[] | {type, ruleset_source}]'
+```
+Empty array `[]` = no rules apply = no protection. A populated array shows rule *types* (`pull_request`, `required_status_checks`, `non_fast_forward`, `deletion`, `required_signatures`, `required_linear_history`, etc.). Rule *parameters* (e.g. "how many reviews required") are admin-only on some rulesets — if returned, pipe to `jq '.'` to see everything.
+
+**3. What rulesets exist on the repo?** (some visibility for non-admins on public repos)
+```sh
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/rulesets" | jq '.[] | {id, name, target, enforcement}'
+```
+If this returns rulesets targeting `tag` with `name_pattern` matching `v*` / `node-sdk/v*.*.*`, tag protection is wired up.
+
+**4. Direct-push detection on `main`.** Compare `committer.login` to `web-flow` (GitHub UI merge bot, id `19864447`):
+```sh
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/commits?sha=main&per_page=30" \
+  | jq '.[] | {sha: .sha[:8], author: .author.login, committer: .committer.login, message: .commit.message | split("\n")[0]}'
+```
+Rows where `committer != "web-flow"` *and* `author == committer` are direct pushes that skipped the PR flow. A healthy protected repo has *every* `main` commit with `committer: "web-flow"`.
+
+**5. Signed-commit compliance on `main`.** The `.commit.verification` object is populated on the commits endpoint:
+```sh
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/commits/main" \
+  | jq '.commit.verification'
+```
+`{"verified": true, "reason": "valid"}` = signed and verified. `{"verified": false, "reason": "unsigned"}` = no signature. Scan 30+ recent commits to see the pattern.
+
+**6. Tag signing.** Per tag:
+```sh
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/tags" | jq '.[:10] | .[] | {name, commit: .commit.sha[:8]}'
+# Then for any tag of interest:
+TAG_SHA=...
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/git/tags/$TAG_SHA" \
+  | jq '{tag, verification}' 2>/dev/null
+```
+(Note: lightweight tags don't have tag objects; only annotated/signed tags do. An empty `git/tags/*` response means lightweight tags — i.e. no signing.)
+
+**7. PR review discipline.** Inspect merged PRs to verify reviews actually occurred:
+```sh
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/pulls?state=closed&per_page=20" \
+  | jq '.[] | select(.merged_at != null) | {number, title, author: .user.login, merged_by: .merged_by.login, requested_reviewers: [.requested_reviewers[]?.login]}'
+# For a specific PR's reviews:
+curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/pulls/<PR#>/reviews" \
+  | jq '[.[] | {user: .user.login, state, submitted_at}]'
+```
+PRs where `merged_by == user` (self-merge) and there are zero `APPROVED` reviews indicate no required-review policy.
+
+**8. Ruleset bypass actors** (admin-only, but worth noting it's what you *can't* see): who's allowed to skip the rules (emergency-push roles, apps, individual bypass grants) is only readable to repo admins via `/repos/{owner}/{repo}/rulesets/{id}` with full read. If the PR-review count returns `null` in step 3, that's because the ruleset detail is gated.
+
+**What's truly admin-only:**
+- Full branch-protection config: `required_approving_review_count`, `dismiss_stale_reviews`, `require_code_owner_reviews`, lock branch, etc.
+- Ruleset bypass actor lists.
+- Collaborator/team memberships and who has what role.
+- Audit log (who changed what setting when).
+- Actions secrets inventory (names + last-updated timestamps — only the *names* are sometimes admin-gated; never the values).
+
+If the user running the runbook finds `"protected": false` + direct-push commits in step 4, that's a complete F27 confirmation without needing admin. If `"protected": true` but rules in step 2 are thin (e.g. only `non_fast_forward`, no `pull_request`), that's a partial-protection finding.
 
 ---
 
