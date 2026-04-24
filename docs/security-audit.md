@@ -88,7 +88,7 @@ Shai-Hulud and Axios both proceeded via compromised maintainer accounts → push
 | # | Finding | Type | Action |
 |---|---|---|---|
 | 9 | F27a | **[CONFIG]** | **Add a tag-protection ruleset** for `v*` and `node-sdk/v*.*.*` with `creation`, `deletion`, `non_fast_forward` rules and an empty bypass list. Upstream has branch protection on `main` but nothing on tags, so tag push = release without any gate beyond who has push. |
-| 10 | F27 (remaining) | **[CONFIG]** | **Remove maintainer bypass** from both active branch rulesets (org-wide `8667238` and repo-local `14481526`). Off-sandbox probe showed 9/9 recent `main` commits by the primary maintainer skipped the `pull_request` rule — classic Shai-Hulud target. Require a co-reviewer even for maintainer commits. |
+| 10 | F27 (remaining) | **[CONFIG]** | **Remove maintainer bypass** from both active branch rulesets (org-wide `8667238` and repo-local `14481526`). Off-sandbox probe surfaced `main` commits by the primary maintainer that skipped the `pull_request` rule (runbook recipe #7 gives the rate) — classic Shai-Hulud target. Require a co-reviewer even for maintainer commits. |
 | 11 | F28 | **[PR]** | Add `CODEOWNERS` covering workflows, release config, crypto/auth/oauth/session, embedded-trust paths (`cmd/skill_*.md`, `persistent_instructions_admin.txt`, email templates, SQL migrations, sandbox assets). Draft policy in F28 writeup. |
 | 12 | F2 | **[BOTH]** | PR adds `environment: release` to release workflows. Maintainer creates the environment with required reviewers + tag-pattern deployment restrictions, moves secrets to it. |
 | 13 | F27b | **[CONFIG]** | Add `required_signatures` rule to both branch and (new) tag rulesets. Upstream currently at 74% commit / 40% tag signing — encouraged but not enforced. Tag signing in particular matters for release provenance. |
@@ -677,30 +677,24 @@ Initial framing (based on `gregclermont/agent-vault` mirror returning `protected
 
 That's a structurally hardened setup — force-push blocked, deletion blocked, PR review required, CI required, linear history.
 
-**But the merge discipline doesn't match.** Inspecting 9 consecutive recent commits on `main`:
+**But at least some commits slip past the `pull_request` rule.** Inspecting recent commits on `main` surfaced a subset where `author.login == committer.login == dangtony98` with no `(#NNN)` PR number in the commit message. Contrast with the *other* pattern (visible both on the mirror and for external contributors): committer flips to `web-flow` with `(#NNN)` in the title for PR-merged commits.
 
-- All 9 have `author.login == committer.login == dangtony98`.
-- None have `(#NNN)` PR numbers in commit messages.
-- Contrast with the *other* pattern visible on the mirror: when external contributors merge, the committer flips to `web-flow` with `(#NNN)` in the title.
-
-On a branch where `pull_request` is a required rule, the only ways this can happen are:
-
-1. **The maintainer is a bypass actor on both rulesets** (most likely). Rulesets support per-actor bypass allowlists, and it's a common pattern for the primary maintainer to hold one on their own projects.
-2. PRs are being rebase-merged in a way that preserves the original committer *and* strips `(#NNN)` from titles. Rare.
-3. These went through PRs whose titles happen to omit `(#NNN)`. Unlikely given the clean binary pattern.
-
-**Severity implication:** structural protection blocks the *external* compromise paths (a contributor can't push to `main` without a PR). It does not block the *Shai-Hulud-class* path — if the primary maintainer's account or laptop is compromised, the compromised identity inherits the bypass and can push to `main` directly, skipping review. Given the 2025-2026 incident landscape (Axios, Shai-Hulud, tj-actions), this is the more-exploited path.
-
-**Disambiguation (safe off-sandbox probe):**
+The exact *rate* of bypass-vs-PR on `main` is still open — the sample we looked at was a hand-picked suspicious subset, not a random window. Recipe #7 in the runbook (commit → PR association) produces the definitive ratio:
 ```sh
-# For the top 10 main commits, list PRs that include each one.
-# Empty arrays = direct-push confirmation; populated = PR-merged.
-for sha in $(curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/commits?sha=main&per_page=10" | jq -r '.[].sha'); do
+for sha in $(curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/commits?sha=main&per_page=50" | jq -r '.[].sha'); do
     printf "%s  " "${sha:0:8}"
     curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/commits/$sha/pulls" \
         | jq -r 'if length == 0 then "DIRECT PUSH" else map("#\(.number)") | join(",") end'
 done
 ```
+Run this across a 50-100-commit window and count the `DIRECT PUSH` rows. Even one is already a finding on a branch with `pull_request` required; the rate tells you whether this is "occasional operator convenience" or "the default path."
+
+**How the bypass is technically possible on a PR-protected branch:** only two realistic explanations:
+
+1. **Maintainer is a bypass actor on one or both rulesets** (most likely). Rulesets support per-actor bypass allowlists, and it's a common pattern for the primary maintainer to hold one on their own projects.
+2. PRs are being rebase-merged in a way that preserves the original committer *and* strips `(#NNN)` from titles. Rare, but requires recipe #7 to rule out.
+
+**Severity implication:** structural protection blocks the *external* compromise paths (a contributor can't push to `main` without a PR). It does not block the *Shai-Hulud-class* path — if the primary maintainer's account or laptop is compromised, the compromised identity inherits any bypass grant and can push to `main` directly, skipping review. Given the 2025-2026 incident landscape (Axios, Shai-Hulud, tj-actions), this is the more-exploited path regardless of whether the bypass is used often or rarely.
 
 **Recommendation for upstream maintainers:**
 - Remove the maintainer from the ruleset bypass allowlist (admin-only in repo settings → Rules → Rulesets → edit → Bypass list). Self-review via a second maintainer or a dedicated reviewer team is the standard alternative.
