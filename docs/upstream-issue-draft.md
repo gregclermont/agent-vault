@@ -21,17 +21,18 @@ Before I send anything as PRs, I wanted to check which (if any) you'd welcome. E
 
 1. **Dependabot cooldown** — catches freshly-published malicious versions before they land in auto-PRs.
 2. **`npm install` → `npm ci` in `release-node-sdk.yml`** — installs strictly from the lockfile, closing the window between what CI tested and what ships to npm. The exact vector the Axios compromise exploited.
-3. **Downgrade `contents: write` → `contents: read`** on the node-sdk publish workflow — checkout needs `contents: read`; OIDC publish needs `id-token: write`; nothing in the job writes to the repo. (Can't *remove* the `contents:` line entirely — any declared `permissions:` block forces unspecified permissions to `none`, which would break checkout.)
-4. **`persist-credentials: false`** on `actions/checkout` — found by `zizmor` (artipacked). No `git push` happens in any workflow, so the `GITHUB_TOKEN` doesn't need to be left in `.git/config`.
-5. **`--proto '=https'`** on `install.sh` curl calls — defense-in-depth against HTTP redirect downgrade.
-6. **Pin Dockerfile base images by digest** and enable Dependabot's `docker` ecosystem — floating tags (`alpine:3.21`, `node:22-alpine`, `golang:1.25-alpine`) are mutable upstream; a retag or compromise lands silently in the next build. Digest pinning (`@sha256:...`) makes base-image changes opt-in; the Dependabot docker ecosystem keeps the pins fresh so they don't rot.
-7. **`actions/attest-build-provenance` after GoReleaser** — enables `gh attestation verify agent-vault_*.tar.gz --repo Infisical/agent-vault` for users with zero extra tool install.
-8. **`docker_signs` block in `.goreleaser.yml`** — cosign is already installed in the release workflow; it's currently only used to sign `checksums.txt`.
+3. **`npm ci --ignore-scripts` + `npm rebuild esbuild`** across all npm install steps — blocks arbitrary `postinstall` execution in transitive deps (Shai-Hulud's propagation mechanism), while still letting esbuild fetch its platform binary. Applies mechanically to ~7 spots (ci.yml × 2, release-node-sdk.yml, the two Makefile targets, Dockerfile frontend stage). Happy to bundle with a small CI assertion that fails if the lockfile gains a new `hasInstallScript` dep so the allowlist can't silently drift.
+4. **Downgrade `contents: write` → `contents: read`** on the node-sdk publish workflow — checkout needs `contents: read`; OIDC publish needs `id-token: write`; nothing in the job writes to the repo. (Can't *remove* the `contents:` line entirely — any declared `permissions:` block forces unspecified permissions to `none`, which would break checkout.)
+5. **`persist-credentials: false`** on `actions/checkout` — found by `zizmor` (artipacked). No `git push` happens in any workflow, so the `GITHUB_TOKEN` doesn't need to be left in `.git/config`.
+6. **`--proto '=https'`** on `install.sh` curl calls — defense-in-depth against HTTP redirect downgrade.
+7. **Pin Dockerfile base images by digest** and enable Dependabot's `docker` ecosystem — floating tags (`alpine:3.21`, `node:22-alpine`, `golang:1.25-alpine`) are mutable upstream; a retag or compromise lands silently in the next build. Digest pinning (`@sha256:...`) makes base-image changes opt-in; the Dependabot docker ecosystem keeps the pins fresh so they don't rot.
+8. **`actions/attest-build-provenance` after GoReleaser** — enables `gh attestation verify agent-vault_*.tar.gz --repo Infisical/agent-vault` for users with zero extra tool install.
+9. **`docker_signs` block in `.goreleaser.yml`** — cosign is already installed in the release workflow; it's currently only used to sign `checksums.txt`.
 
 ## Bigger but still small-ish
 
-9. **Checksum + cosign verification in `install.sh`** — the current installer downloads and executes the binary without integrity verification, despite `.goreleaser.yml` already publishing a signed `checksums.txt`. Largest single impact of any change here; happy to send as its own PR after (7) lands so it can prefer `gh attestation verify` when available.
-10. **Add `govulncheck` and `osv-scanner` jobs to `ci.yml`** — advisory-mode to start, tighten to blocking later. Covers all three lockfiles (`go.sum`, `web/package-lock.json`, `sdks/sdk-typescript/package-lock.json`).
+10. **Checksum + cosign verification in `install.sh`** — the current installer downloads and executes the binary without integrity verification, despite `.goreleaser.yml` already publishing a signed `checksums.txt`. Largest single impact of any change here; happy to send as its own PR after (8) lands so it can prefer `gh attestation verify` when available.
+11. **Add `govulncheck` and `osv-scanner` jobs to `ci.yml`** — advisory-mode to start, tighten to blocking later. Covers all three lockfiles (`go.sum`, `web/package-lock.json`, `sdks/sdk-typescript/package-lock.json`).
 
 ## Things that need maintainer action (flagging, not PR'ing)
 
@@ -44,8 +45,8 @@ These are settings / external-infra changes only you can make. Listing so they'r
 
 ## A few questions before I start
 
-- **Bundling preference** — happy with 10 separate small PRs, or would you rather a couple of "security hardening batch" PRs grouped by concern (e.g. one for Dependabot-related, one for permissions)?
-- **Order preference** — I'd suggest starting with 1-5 (truly tiny wins, easy review), then 6-8 (still small, need one look), then 9-10 (slightly bigger). Open to any order you prefer.
+- **Bundling preference** — happy with 11 separate small PRs, or would you rather a couple of "security hardening batch" PRs grouped by concern (e.g. one for Dependabot-related, one for permissions)?
+- **Order preference** — I'd suggest starting with 1-6 (truly tiny wins, easy review), then 7-9 (still small, need one look), then 10-11 (slightly bigger). Open to any order you prefer.
 - **Overlap** — if any of this is already planned or WIP on your end, just say so and I'll drop it.
 
 Thanks for the project!

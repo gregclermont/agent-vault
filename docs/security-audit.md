@@ -30,7 +30,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 | F15 | medium | supply-chain | No vuln scanning in CI (`govulncheck`/`osv`/`trivy`) |
 | F16 | medium | supply-chain | Dependabot missing `sdks/sdk-typescript` and `docker` |
 | F17 | info | supply-chain | `skills-lock.json` is orphaned (dead integrity mechanism) |
-| F18 | info | supply-chain | npm install scripts (esbuild/fsevents) outside lockfile |
+| F18 | low | supply-chain | npm install scripts run unrestricted across transitive tree (Shai-Hulud propagation mechanism) |
 | F19 | low | supply-chain | `go.mod` lacks explicit `toolchain` directive |
 | F20 | **high** | install | `install.sh` does not verify checksums or signatures |
 | F21 | medium | install | JSON parsed from GitHub API via `grep | sed` |
@@ -104,9 +104,10 @@ Shai-Hulud and Axios both proceeded via compromised maintainer accounts → push
 | 15 | F16 | **[PR]** | Extend Dependabot to `sdks/sdk-typescript` (npm) and `docker`. |
 | 16 | F15 | **[PR]** | Add `govulncheck`, `osv-scanner` (covers all three lockfiles), and eventually `trivy image` after F14+F9. Audit-mode with PR-summary SARIF upload first; tighten to blocking after signal stabilises. |
 | 17 | F5 | **[PR]** | Change `npm install` to `npm ci` in `release-node-sdk.yml` (the Axios incident is a direct warning here — different CI and publish dep trees are how malicious versions slip through). |
-| 18 | *Harden-Runner* | **[PR]** | Add `step-security/harden-runner@<sha>` as first step of every job. Audit-mode initially; review egress reports; promote to `block` once baseline is known. Shai-Hulud exfil endpoints become observable. |
-| 19 | *Socket Firewall* | **[PR]** | Wrap the `npm ci` step in `release-node-sdk.yml` (and optionally `ci.yml`) with `sfw` to block install-script egress. Defends against Shai-Hulud 2.0's preinstall mechanism in any transitive dep. |
-| 20 | F11 | **[PR]** | Add `actions/attest-build-provenance@<sha>` after GoReleaser. Gives verifiers a stronger "built by *this workflow at this commit*" signal than cosign blob-signing alone. |
+| 18 | F18 | **[PR]** | Add `--ignore-scripts` to every `npm ci` (and `npm install`) + explicit `npm rebuild esbuild` to re-enable esbuild's binary-download postinstall. Directly blocks Shai-Hulud-class propagation via compromised transitive deps. Pair with a lockfile-assertion CI job that fails if new `hasInstallScript` packages appear. Declarative manifest-level alternative: `@lavamoat/allow-scripts` — a natural follow-up once the shell-flag pattern is accepted. |
+| 19 | *Harden-Runner* | **[PR]** | Add `step-security/harden-runner@<sha>` as first step of every job. Audit-mode initially; review egress reports; promote to `block` once baseline is known. Shai-Hulud exfil endpoints become observable. |
+| 20 | *Socket Firewall* | **[PR]** | Wrap the `npm ci` step in `release-node-sdk.yml` (and optionally `ci.yml`) with `sfw` to block install-script *egress* at the network layer — complementary to #18, which blocks script *execution*. Together they neutralize Shai-Hulud 2.0's preinstall mechanism even inside the esbuild allowlist. |
+| 21 | F11 | **[PR]** | Add `actions/attest-build-provenance@<sha>` after GoReleaser. Gives verifiers a stronger "built by *this workflow at this commit*" signal than cosign blob-signing alone. |
 
 ### Tier 4 — workflow hardening polish
 
@@ -137,8 +138,7 @@ Cheap, non-urgent, close out in a single PR each.
 | 36 | F31 | **[BOTH]** | PR adds `zricethezav/gitleaks-action`. Maintainer enables GitHub native Secret Scanning + Push Protection. |
 | 37 | F34 defense | **[PR]** | Add CSP headers to admin UI responses (server-side edit, not a workflow change — logged here so the audit's priority list is complete). |
 | 38 | F22 | **[PR]** | Fallback for the 60-req/h anonymous GitHub API limit in `install.sh` (`https://github.com/.../releases/latest` redirect parse). |
-| 39 | F18 | — | Accept & document. Inherent to esbuild/fsevents; mitigated by Tier-3 item #19 (Socket Firewall). |
-| 40 | F32 | — | Covered by Tier-3 item #18 (Harden-Runner). Drop from open list once that lands. |
+| 39 | F32 | — | Covered by Tier-3 item #19 (Harden-Runner). Drop from open list once that lands. |
 
 ### Ordering intuition
 
@@ -529,11 +529,41 @@ Consequence: a reviewer who sees `skills-lock.json` may incorrectly assume it en
 
 **Recommendation:** either (a) delete `skills-lock.json` and the "computedHash" idea until a loader lands, or (b) wire it up — add a build-time check that the computed hash of each embedded `cmd/skill_*.md` matches `skills-lock.json`, failing `make build` on drift. Option (a) is cheaper given there's no remote-fetch code path.
 
-**F18 — npm install scripts allowed in lockfiles (esbuild, fsevents)** (informational)
+**F18 — npm install scripts run unrestricted across the transitive tree** (low → mitigable)
 
-Both `web/package-lock.json` and `sdks/sdk-typescript/package-lock.json` include `esbuild` and `fsevents`, both with `"hasInstallScript": true`. `esbuild`'s postinstall downloads a platform-specific prebuilt binary outside the lockfile integrity scope; `fsevents` is a macOS-only native module. These are legitimate and hard to remove (esbuild is a dep of vite/tsup). But it does mean the lockfile's integrity hashes don't fully cover what lands on disk after `npm ci`.
+Both `web/package-lock.json` and `sdks/sdk-typescript/package-lock.json` currently have `esbuild` and `fsevents` as the only packages with `"hasInstallScript": true` — those two are legitimate (esbuild's postinstall downloads its platform binary; fsevents is a macOS-only native module). However, `npm ci` runs `preinstall`/`install`/`postinstall`/`prepare` for **any** package in the tree that declares them. A malicious transitive dep added via future dep update, or a compromised existing dep, would get to execute arbitrary code during install. This is the exact mechanism the Shai-Hulud npm worm uses to propagate (Sep + Nov 2025 ecosystem compromises).
 
-**Recommendation:** this is inherent to the toolchain; accept and document. If desired, pin esbuild to a specific version and trust the pattern. Do **not** add `--ignore-scripts` broadly — esbuild won't function without its postinstall binary download.
+**Recommendation — `--ignore-scripts` + allowlist via `npm rebuild`**:
+
+Replace every `npm ci` (and `npm install` where present) with:
+```
+npm ci --ignore-scripts && npm rebuild esbuild
+```
+- `--ignore-scripts` blocks *all* install-lifecycle scripts — preinstall, install, postinstall, prepare, prepublish, prepublishOnly — for every package in the tree.
+- `npm rebuild esbuild` then explicitly re-runs the install script for esbuild only, which fetches its platform binary. `fsevents` is macOS-only and isn't installed on the `ubuntu-latest` runners; no rebuild needed there.
+
+Applies to:
+- `.github/workflows/ci.yml:32, 41, 62`
+- `.github/workflows/release-node-sdk.yml:35` (in combination with F5's `npm install` → `npm ci` change)
+- `Makefile:13, 57`
+- `Dockerfile:6`
+
+**Belt-and-suspenders:** add a CI job that asserts the set of `hasInstallScript` packages in each lockfile is exactly `{esbuild, fsevents}`. A new install-script dep appearing in a Dependabot PR would then either force an explicit allowlist update (reviewable) or fail the build — no silent execution.
+
+**Declarative alternative: `@lavamoat/allow-scripts`.** MetaMask's LavaMoat project provides a drop-in that moves the allowlist into `package.json`:
+```json
+{
+  "lavamoat": {
+    "allowScripts": {
+      "esbuild": true,
+      "fsevents": true
+    }
+  }
+}
+```
+Workflow becomes `npm ci --ignore-scripts && npx allow-scripts`. Benefits: allowlist is declarative and lives in the manifest (reviewable in PR diffs), `allow-scripts auto` generates the initial config, and new install-script deps fail loudly instead of silently landing. Cost: one additional (well-scrutinized) devDep per package. The shell-flag pattern above is the right first step; LavaMoat is the natural follow-up for a project that wants the manifest-declarative form.
+
+**Native alternatives on other package managers** (out of scope for a small PR, noted for completeness): pnpm's `pnpm.onlyBuiltDependencies` and Bun's `trustedDependencies` both provide this as a manifest field natively. Switching package managers is a bigger change than agent-vault would want for this reason alone.
 
 **F19 — `go.mod` lacks an explicit `toolchain` directive** (low)
 
