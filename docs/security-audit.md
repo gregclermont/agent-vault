@@ -45,7 +45,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 | F27c | medium | repo | Immutable releases not confirmed enabled — mitigates Trivy/tj-actions-class asset-swap attacks |
 | F28 | medium | repo | No CODEOWNERS file |
 | F29 | low | repo | No signed-commit / DCO enforcement |
-| F30 | medium | repo | `GO_RELEASER_GITHUB_TOKEN` likely a PAT with cross-repo scope |
+| F30 | medium | repo | `GO_RELEASER_GITHUB_TOKEN` is a PAT (workflow fingerprint rules out GitHub App); severity depends on classic vs fine-grained |
 | F31 | low | repo | No secret-scanning tooling in-repo |
 | F32 | low | project | Sensitive-internal tests run in fork-PR CI (mitigated) |
 | F33 | medium | project | Skill doc tamper path (agents trust embedded markdown) |
@@ -94,7 +94,7 @@ Shai-Hulud and Axios both proceeded via compromised maintainer accounts → push
 | 12 | F2 | **[BOTH]** | PR adds `environment: release` to release workflows. Maintainer creates the environment with required reviewers + tag-pattern deployment restrictions, moves secrets to it. |
 | 13 | F27b | **[CONFIG]** | Add `required_signatures` rule to both branch and (new) tag rulesets. Upstream currently at 74% commit / 40% tag signing — encouraged but not enforced. Tag signing in particular matters for release provenance. |
 | 14 | F27c | **[CONFIG]** | **Enable Immutable Releases** in repo settings → Releases. Single-checkbox config that directly mitigates the Trivy-class (March 2026) and tj-actions-class (March 2025) tag/asset mutation attacks. Complements F9 (cosign) by making the platform itself enforce immutability. |
-| 15 | F30 | **[CONFIG]** | Migrate `GO_RELEASER_GITHUB_TOKEN` from a personal PAT to a **GitHub App installation token** scoped to `Infisical/homebrew-get-cli` `contents:write` only. Shai-Hulud-class risk: a PAT on any maintainer's laptop is one `npm install` away from being exfiltrated. |
+| 15 | F30 | **[CONFIG]** | Confirm `GO_RELEASER_GITHUB_TOKEN` type (classic PAT vs fine-grained PAT — workflow fingerprint rules out GitHub App). If classic, migrate to a fine-grained PAT scoped to `Infisical/homebrew-get-cli` `contents:write`, or to a GitHub App installation. Shai-Hulud-class risk: a static PAT anywhere on a maintainer machine is one `npm install` away from exfiltration. |
 
 ### Tier 3 — dependency supply chain (the Shai-Hulud / Axios ingress paths)
 
@@ -769,16 +769,53 @@ Replace team handles with whatever the Infisical org uses.
 
 No DCO bot workflow, no `.github/workflows/dco.yml`, no `CONTRIBUTING.md` mention of signing. Not a strict requirement, but when combined with F27 (no branch protection) and F28 (no CODEOWNERS), it weakens the evidence chain on *who produced a given commit*. For a security-sensitive project, consider requiring signed commits (`git commit -S`) on `main` via branch protection.
 
-**F30 — `GO_RELEASER_GITHUB_TOKEN` is likely a PAT with cross-repo scope** (medium, out-of-repo)
+**F30 — `GO_RELEASER_GITHUB_TOKEN` is almost certainly a Personal Access Token** (severity depends on PAT type)
 
-`release.yml:60` passes `GO_RELEASER_GITHUB_TOKEN` as `HOMEBREW_TAP_TOKEN` to goreleaser, per the (currently commented-out) `brews:` block in `.goreleaser.yml`. This is a PAT that needs write access to `Infisical/homebrew-get-cli` — i.e., a *different* repo than the workflow runs in. The default `GITHUB_TOKEN` can't reach that repo, hence the PAT.
+**Evidence:**
 
-Risks:
-- Classic PATs are scoped per-user; if the owning account is compromised, so is the Homebrew tap.
-- Classic PATs typically have wider scope than the one repo they're used for (reading all private repos, for example).
-- Fine-grained PATs (introduced in 2022) can be scoped to a single repo but still live on a user account.
+- `.github/workflows/release.yml:60` reads the secret directly and passes it as an env var:
+  ```yaml
+  env:
+    HOMEBREW_TAP_TOKEN: ${{ secrets.GO_RELEASER_GITHUB_TOKEN }}
+  ```
+- `.goreleaser.yml:64-68` (commented-out `brews:` block) consumes it as `{{ .Env.HOMEBREW_TAP_TOKEN }}` — a static bearer token in goreleaser's `token:` field.
+- **No App-token-generation step in the workflow.** A GitHub App installation token would require a runtime step using `actions/create-github-app-token` or equivalent, reading an App private key from secrets and outputting a ~60-minute token. No such step exists in `release.yml`; the token is read once, directly, from a long-lived secret.
+- App installation tokens expire after 60 minutes, so a pre-generated static secret containing an App token would only work for one hour post-storage — inconsistent with any recurring release cadence.
 
-**Recommendation:** migrate to a **GitHub App** installation with `contents: write` on `Infisical/homebrew-get-cli` only. The App installation token is per-workflow-run, short-lived, and not tied to a human account. Alternatively, verify the current token is a fine-grained PAT scoped to that single repo and held on a machine account with SSO + 2FA.
+Conclusion: **PAT** (classic or fine-grained). The `_GITHUB_TOKEN` suffix in the name is a naming hint; the workflow-fingerprint absence of any App-token generator is what actually settles it.
+
+**Why a separate token at all:** `HOMEBREW_TAP_TOKEN` needs write access to `Infisical/homebrew-get-cli`, a *different* repo from where the workflow runs. The default `GITHUB_TOKEN` is scoped to the running repo only and can't reach the tap.
+
+**Severity depends on PAT type (and we can't tell which from outside):**
+
+| PAT type | Blast radius if compromised |
+|---|---|
+| Classic PAT | Broad implicit scope — reads everything the owning user can see across all repos they have access to, org-wide. Worst case. |
+| Fine-grained PAT scoped to `Infisical/homebrew-get-cli` with `contents: write` | Blast radius limited to that one repo. Much better, but still a static user-bound secret. |
+
+Either way, the **Shai-Hulud-class risk is the same**: a PAT lives somewhere — a maintainer's laptop, an org machine account, perhaps only in GitHub Actions secret storage. Any of those is harvestable by the npm-dep-exfil attacks observed in Sep/Nov 2025. The npm worm specifically targets GitHub PATs stored in `~/.npmrc`, `~/.config/gh/`, CI env, and dotfiles.
+
+**Recommendation (for upstream maintainers):**
+
+1. **Confirm which type it is.** In repo settings → Secrets and variables → Actions, the secret metadata may show its origin; alternatively the maintainer who set it up knows.
+2. **If classic PAT:** migrate urgently to either a fine-grained PAT (scoped to `homebrew-get-cli` `contents: write` only, held on a machine account with hardware-key 2FA) or — better — a GitHub App. The App pattern looks like:
+   ```yaml
+   - uses: actions/create-github-app-token@<sha>
+     id: tap-token
+     with:
+       app-id: ${{ secrets.TAP_APP_ID }}
+       private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+       owner: Infisical
+       repositories: homebrew-get-cli
+   - name: Run GoReleaser
+     uses: goreleaser/goreleaser-action@<sha>
+     with: { args: release --clean }
+     env:
+       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+       HOMEBREW_TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
+   ```
+   The App installation is the only step that needs a stored private key; the resulting token is workflow-run-scoped and expires in an hour.
+3. **If fine-grained PAT already:** confirm scope and ownership. Acceptable risk posture; GitHub App migration is a nice-to-have, not urgent.
 
 **F31 — No secret-scanning tooling in-repo** (low)
 

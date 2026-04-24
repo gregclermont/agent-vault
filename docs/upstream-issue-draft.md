@@ -56,7 +56,7 @@ These are settings / external-infra changes only you can make. Listing so they'r
   CAA 0 iodef     "mailto:security@infisical.com"
   ```
   (Both CAs because Cloudflare ACM rotates between them.)
-- **`GO_RELEASER_GITHUB_TOKEN`** appears to be a PAT (needs write to `Infisical/homebrew-get-cli`, which `GITHUB_TOKEN` can't reach). A GitHub App installation token scoped to that one repo with `contents:write` would remove the "PAT on a maintainer machine" risk class — the primary vector Shai-Hulud exploits.
+- **`GO_RELEASER_GITHUB_TOKEN`** — the secret is read directly as a static value (`release.yml:60`) rather than generated at runtime from a GitHub App (no `actions/create-github-app-token` step in the workflow), which rules out an App installation token (those expire in ~60 min and wouldn't survive a recurring release cadence as a static secret). That leaves: **classic PAT** or **fine-grained PAT**. If it's a classic PAT, migrating to a fine-grained PAT scoped to `Infisical/homebrew-get-cli` `contents:write` only (ideally on a machine account with hardware-key 2FA) would be a major blast-radius reduction. A GitHub App installation is even better. If it's already a scoped fine-grained PAT, current posture is fine — would just be useful to confirm.
 
 ## A few questions before I start
 
