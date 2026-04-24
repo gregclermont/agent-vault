@@ -56,6 +56,134 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 
 ---
 
+## Prioritized remediation plan
+
+Grounded in 2025-2026 supply-chain incident patterns (Shai-Hulud worm — npm token harvest + preinstall propagation; Axios — stolen npm token beats co-configured OIDC; Trivy / tj-actions — force-pushed tags on SHA-pinned transitive action deps; prt-scan — AI-generated `pull_request_target` injection). Each row marks:
+- **[PR]** = code contribution anyone with a fork can send as a pull request.
+- **[CONFIG]** = maintainer action only (GitHub repo/org settings, external infra like Cloudflare/Docker Hub/npm, or account hygiene). Can't be landed by a PR.
+- **[BOTH]** = PR lands the code; a maintainer flips a switch after merge (e.g. create a `release` environment and attach secrets).
+
+### Tier 1 — install-path integrity (the curl|sh and docker-pull trust roots)
+
+Every user passes through one of these paths. If the Tier-1 controls fail, every user is compromised. Highest ROI for attackers; highest priority to close.
+
+| # | Finding | Type | Action |
+|---|---|---|---|
+| 1 | F20 | **[PR]** | Add sha256 verification (mandatory) and cosign verify-blob (optional) to `install.sh`. Patch written out in the F20 writeup. |
+| 2 | F9 | **[PR]** | Add `docker_signs:` block to `.goreleaser.yml` so cosign signs pushed images. |
+| 3 | F14 | **[PR]** | Pin `alpine:3.21`, `node:22-alpine`, `golang:1.25-alpine` by `@sha256:<digest>` in both Dockerfiles. |
+| 4 | F26 | **[PR]** | Add `--proto '=https' --proto-redir '=https'` to every `curl` in `install.sh`. |
+| 5 | F24c | **[CONFIG]** | Enable DNSSEC on `agent-vault.dev` in Cloudflare; file DS record at registrar. |
+| 6 | F24d | **[CONFIG]** | Add CAA records (concrete policy in F24d writeup: `pki.goog` + `letsencrypt.org` for `issue` and `issuewild`, `iodef` mailto). |
+| 7 | F24e + F24f | **[CONFIG]** | Add HSTS + security-response headers via Cloudflare transform rules. |
+| 8 | F24g | **[CONFIG]** | Harden Cloudflare account: hardware-key 2FA, scoped API tokens, deploy `install.sh` from an in-repo source at a pinned commit. |
+
+### Tier 2 — prevent malicious code reaching `main` and release tags
+
+Shai-Hulud and Axios both proceeded via compromised maintainer accounts → push malicious version. Branch protection + scoped release creds raise that cost sharply.
+
+| # | Finding | Type | Action |
+|---|---|---|---|
+| 9 | F27 | **[CONFIG]** | Enable branch protection on `main`: required reviews, required status checks, no force-push, linear history, signed commits (ties to F29). |
+| 10 | F28 | **[PR]** | Add `CODEOWNERS` covering workflows, release config, crypto/auth/oauth/session, embedded-trust paths (`cmd/skill_*.md`, `persistent_instructions_admin.txt`, email templates, SQL migrations, sandbox assets). Draft policy in F28 writeup. |
+| 11 | F2 | **[BOTH]** | PR adds `environment: release` to release workflows. Maintainer creates the environment with required reviewers + tag-pattern deployment restrictions, moves secrets to it. |
+| 12 | *tag protection* | **[CONFIG]** | Tag protection rules on `v*` and `node-sdk/v*.*.*`. Prevents non-admins from cutting releases even if they land a bad commit. |
+| 13 | F30 | **[CONFIG]** | Migrate `GO_RELEASER_GITHUB_TOKEN` from a personal PAT to a **GitHub App installation token** scoped to `Infisical/homebrew-get-cli` `contents:write` only. Shai-Hulud-class risk: a PAT on any maintainer's laptop is one `npm install` away from being exfiltrated. |
+
+### Tier 3 — dependency supply chain (the Shai-Hulud / Axios ingress paths)
+
+| # | Finding | Type | Action |
+|---|---|---|---|
+| 14 | F6 | **[PR]** | Add `cooldown:` to every Dependabot ecosystem (7-day default, 14-day semver-major). Shai-Hulud-published versions tend to be yanked within hours-to-days; cooldown removes the auto-merge risk window entirely. |
+| 15 | F16 | **[PR]** | Extend Dependabot to `sdks/sdk-typescript` (npm) and `docker`. |
+| 16 | F15 | **[PR]** | Add `govulncheck`, `osv-scanner` (covers all three lockfiles), and eventually `trivy image` after F14+F9. Audit-mode with PR-summary SARIF upload first; tighten to blocking after signal stabilises. |
+| 17 | F5 | **[PR]** | Change `npm install` to `npm ci` in `release-node-sdk.yml` (the Axios incident is a direct warning here — different CI and publish dep trees are how malicious versions slip through). |
+| 18 | *Harden-Runner* | **[PR]** | Add `step-security/harden-runner@<sha>` as first step of every job. Audit-mode initially; review egress reports; promote to `block` once baseline is known. Shai-Hulud exfil endpoints become observable. |
+| 19 | *Socket Firewall* | **[PR]** | Wrap the `npm ci` step in `release-node-sdk.yml` (and optionally `ci.yml`) with `sfw` to block install-script egress. Defends against Shai-Hulud 2.0's preinstall mechanism in any transitive dep. |
+| 20 | F11 | **[PR]** | Add `actions/attest-build-provenance@<sha>` after GoReleaser. Gives verifiers a stronger "built by *this workflow at this commit*" signal than cosign blob-signing alone. |
+
+### Tier 4 — workflow hardening polish
+
+Cheap, non-urgent, close out in a single PR each.
+
+| # | Finding | Type | Action |
+|---|---|---|---|
+| 21 | F1 | **[PR]** | Drop `contents: write` on `release-node-sdk.yml`; move all release permissions to job level. |
+| 22 | F3 | **[PR]** | Add `concurrency: { group: release-${{ github.ref }}, cancel-in-progress: false }` to release workflows. |
+| 23 | F7 | **[PR]** | Disable language caches on release jobs (`cache: false` on setup-go / setup-node inside `release.yml`). |
+| 24 | F8 | **[PR]** | `persist-credentials: false` on every `actions/checkout`. |
+| 25 | F4 | **[PR]** | Quote `${GITHUB_REF_NAME#node-sdk/v}` in `release-node-sdk.yml`. |
+| 26 | F13 | **[PR]** | Tighten cosign `--certificate-identity` to the exact release workflow path + templated tag in the goreleaser footer. |
+| 27 | F10 | **[PR]** | Attach SBOMs to Docker images (syft is already installed in the release workflow). |
+| 28 | F19 | **[PR]** | Add explicit `toolchain go1.25.x` directive to `go.mod`. |
+| 29 | F21 | **[PR]** | Validate `LATEST` in `install.sh` against a strict semver regex before using it in URL construction. |
+| 30 | F23 | **[PR]** | Reorder `install.sh`: download → verify → install → run `agent-vault version` → beacon. |
+| 31 | F25 | **[PR]** | Have `install.sh` download the archive's SBOM and drop it alongside the binary. |
+| 32 | F17 | **[PR]** | Resolve `skills-lock.json`: option A (simplest) delete it; option B wire up a build-time hash check (pairs with F33). |
+| 33 | *zizmor CI* | **[PR]** | Add a zizmor job to `ci.yml` (`uv tool install zizmor` → `zizmor --persona=auditor .github/`). |
+
+### Tier 5 — additional scanning + process hygiene
+
+| # | Finding | Type | Action |
+|---|---|---|---|
+| 34 | F12 | **[CONFIG]** | Enable tag immutability on Docker Hub for versioned tags `*-amd64`, `*-arm64`, `0.*`. Complements F9. |
+| 35 | F29 | **[PR]** | Optional DCO workflow / require signed commits in branch protection (ties to F27). |
+| 36 | F31 | **[BOTH]** | PR adds `zricethezav/gitleaks-action`. Maintainer enables GitHub native Secret Scanning + Push Protection. |
+| 37 | F34 defence | **[PR]** | Add CSP headers to admin UI responses (server-side edit, not a workflow change — logged here so the audit's priority list is complete). |
+| 38 | F22 | **[PR]** | Fallback for the 60-req/h anonymous GitHub API limit in `install.sh` (`https://github.com/.../releases/latest` redirect parse). |
+| 39 | F18 | — | Accept & document. Inherent to esbuild/fsevents; mitigated by Tier-3 item #19 (Socket Firewall). |
+| 40 | F32 | — | Covered by Tier-3 item #18 (Harden-Runner). Drop from open list once that lands. |
+
+### Ordering intuition
+
+The tiers are *attacker-cost-to-compromise-you* ordered, not *work-hours-ordered*:
+
+- **Tier 1** closes the paths by which a single compromise → every user compromised. No matter how hardened Tiers 2-5 are, Tier 1 gaps defeat them.
+- **Tier 2** raises the cost of the most-observed 2025-2026 attack class (compromised maintainer identity).
+- **Tier 3** reduces the blast radius *if* a maintainer identity or a dep does get compromised — Harden-Runner + Socket Firewall turn the crown-jewel step (secret exfil) into something visible / blocked.
+- **Tier 4 & 5** are incremental hardening.
+
+---
+
+## For prospective users today (before any upstream fix lands)
+
+You can materially reduce your risk without waiting on the maintainers. None of the following requires upstream cooperation:
+
+1. **Don't pipe `install.sh` to `sh`.** Download the release tarball, `checksums.txt`, and `checksums.txt.bundle` manually from the GitHub release page, then:
+   ```sh
+   VER=0.10.0; OS=linux; ARCH=amd64    # adjust
+   ARCHIVE="agent-vault_${VER}_${OS}_${ARCH}.tar.gz"
+   # sha256
+   grep " ${ARCHIVE}$" checksums.txt | sha256sum -c -
+   # cosign keyless verify
+   cosign verify-blob \
+       --bundle checksums.txt.bundle \
+       --certificate-identity "https://github.com/Infisical/agent-vault/.github/workflows/release.yml@refs/tags/v${VER}" \
+       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+       checksums.txt
+   tar xzf "${ARCHIVE}"
+   # inspect ./agent-vault, then move into place
+   ```
+   This closes **F20** on your end unilaterally. `install.sh` does nothing magic — it just skips verification.
+
+2. **For Docker: pin by digest, not tag.** Until **F9** lands (image signing), you can't verify an image came from the official pipeline — but you *can* establish a trust-on-first-use baseline:
+   ```sh
+   docker pull infisical/agent-vault:0.10.0
+   docker inspect --format '{{index .RepoDigests 0}}' infisical/agent-vault:0.10.0
+   # → reference infisical/agent-vault@sha256:... everywhere
+   ```
+   Tag-mutation attacks (the Trivy-action class) don't affect digest references.
+
+3. **Run the broker with tight egress controls in your own environment.** Agent Vault only needs to talk to the specific upstreams you've configured (Stripe, GitHub, etc.). Block everything else at your network / k8s NetworkPolicy / Cilium level. A post-compromise binary that tries to exfil your vault will hit that firewall before the attacker's C2.
+
+4. **Cool down your upgrades.** F6's upstream fix is Dependabot cooldown. The *consumer* equivalent is: wait 48-72h after a new Agent Vault release before upgrading, then review the tag diff. Shai-Hulud-style compromised versions tend to be yanked within that window.
+
+5. **Watch the three Tier 1 findings (F20, F9, F14).** If the maintainers don't ship these within a few weeks of being notified, treat that as a signal about the project's overall security maturity and reconsider adoption. Given the project's purpose (credential broker), install-path integrity is the price of admission.
+
+6. **Opening issues/PRs on the upstream.** If you want to contribute: every `[PR]` item in Tiers 1-4 is a discrete, landable change. Start with **F20** — it's the single highest-leverage patch in the repo.
+
+---
+
 ## 1. GitHub Actions workflow hardening
 
 - [x] Action pinning: all third-party actions pinned to full commit SHA (not floating tags)
