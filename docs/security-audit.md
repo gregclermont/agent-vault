@@ -23,13 +23,13 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 
 ## 2. Release & signing pipeline
 
-- [ ] Enumerate publish targets (GitHub Releases, Docker registry, npm, Homebrew, etc.)
-- [ ] Build provenance attestations (`actions/attest-build-provenance` or SLSA) on binaries & images
-- [ ] npm publish: token scope, OIDC `id-token: write`, `--provenance` flag, 2FA
-- [ ] Docker image signing (cosign) + SBOM (syft) + immutable tags
-- [ ] Release trigger surface: tag protection, who can cut a release, required reviews
-- [ ] Release-only secrets scoped to the release job (not exposed to CI jobs)
-- [ ] `.goreleaser.yml`: checksums, signatures, SBOM, `-trimpath`, reproducible flags
+- [x] Enumerate publish targets (GitHub Releases, Docker registry, npm, Homebrew, etc.)
+- [x] Build provenance attestations (`actions/attest-build-provenance` or SLSA) on binaries & images — `[!]` see F11
+- [x] npm publish: token scope, OIDC `id-token: write`, `--provenance` flag, 2FA
+- [x] Docker image signing (cosign) + SBOM (syft) + immutable tags — `[!]` see F9, F10, F12
+- [x] Release trigger surface: tag protection, who can cut a release, required reviews — cross-ref F2
+- [x] Release-only secrets scoped to the release job (not exposed to CI jobs) — cross-ref F2
+- [x] `.goreleaser.yml`: checksums, signatures, SBOM, `-trimpath`, reproducible flags — `[!]` see F13, F14
 
 ## 3. Supply chain — dependencies
 
@@ -176,6 +176,91 @@ All four `actions/checkout` invocations (ci.yml x2, release.yml x1, release-node
 
 ---
 
+### Section 2 — Release & signing pipeline
+
+**Publish targets (inventory)**
+
+| Target | What ships | Config | Signing | Provenance |
+|---|---|---|---|---|
+| GitHub Releases | `agent-vault_{ver}_{os}_{arch}.tar.gz` for linux/darwin × amd64/arm64 + `checksums.txt` + `checksums.txt.bundle` (cosign) + SBOMs (syft, per archive) | `.goreleaser.yml` | checksum file cosign-signed (keyless OIDC) | **none** (no SLSA attestation) |
+| Docker Hub | `infisical/agent-vault:{ver}-amd64`, `:{ver}-arm64`, multi-arch manifest `:{ver}` and `:latest` | `.goreleaser.yml` + `Dockerfile.goreleaser` | **not signed** | **none** |
+| npm | `@infisical/agent-vault-sdk` (from `sdks/sdk-typescript/`) | `release-node-sdk.yml` | Sigstore via `npm publish --provenance` | **yes (npm-native)** |
+| Homebrew tap | `Infisical/homebrew-get-cli` | `.goreleaser.yml` (commented out) | — | — |
+
+**Positives (what's already right)**
+
+- Go binary built with `-trimpath`, `-s -w`, `CGO_ENABLED=0` (static), and `mod_timestamp: {{.CommitTimestamp}}` — a decent step toward reproducibility.
+- `checksum: sha256` + cosign `sign-blob` with `--yes` (keyless, OIDC via `id-token: write`).
+- SBOMs generated for tarball archives (`sboms: [artifacts: archive]`).
+- npm publish uses OIDC (no `NODE_AUTH_TOKEN` in workflow) + `--provenance` + `--access public`.
+- `Dockerfile.goreleaser` runs as a dedicated non-root user (`agentvault`, uid 65532), minimal alpine base, bundles only the prebuilt binary + entrypoint.
+- Verification instructions are embedded in the release footer (checksum + cosign verify-blob).
+- `make web` (goreleaser `before.hooks`) correctly uses `npm ci` — so the embedded frontend is deterministic in the main release path (only the npm-SDK publish workflow is affected by F5).
+
+---
+
+**F9 — Docker images are not cryptographically signed** (high, supply chain)
+
+`.goreleaser.yml:45-53` — the `signs:` block uses `artifacts: checksum`, which signs only `checksums.txt`. Docker Hub images `infisical/agent-vault:{ver}-{arch}` and the multi-arch manifests (`:ver`, `:latest`) have **no cosign signature**. A consumer pulling `infisical/agent-vault:latest` has no way to verify it came from this repo's release pipeline. Given the project's trust model (credential broker with root-CA private-key material), this is the single biggest release-integrity gap.
+
+**Recommendation:** add a `docker_signs:` block to `.goreleaser.yml` so cosign signs each image after push — example:
+```yaml
+docker_signs:
+  - cmd: cosign
+    artifacts: images
+    args:
+      - "sign"
+      - "--yes"
+      - "${artifact}@${digest}"
+```
+Document the `cosign verify` invocation in README alongside the existing blob-verify snippet.
+
+**F10 — No SBOM for Docker images** (medium, supply chain)
+
+`sboms: [artifacts: archive]` generates SBOMs only for the tarball archives. The Docker images have no attached SBOM, so downstream consumers can't enumerate what's inside them. Syft is already installed in the release workflow — it just isn't invoked for images.
+
+**Recommendation:** add an image-SBOM block:
+```yaml
+sboms:
+  - artifacts: archive
+  - artifacts: package    # attaches SBOM to each docker image
+    documents:
+      - "{{ .ArtifactName }}.spdx.sbom.json"
+```
+Or attach via `cosign attest --predicate sbom.json` as an OCI referrer.
+
+**F11 — No SLSA build provenance attestation for binaries or images** (medium, supply chain)
+
+Neither `actions/attest-build-provenance` nor `slsa-framework/slsa-github-generator` is wired up. Cosign signs the checksum blob (good) but doesn't bind the artifact to a specific *builder* (workflow ref / commit SHA / runner identity) the way SLSA provenance does. This is the gap between "this file's hash was signed by someone with our OIDC identity" and "this file was produced by this specific workflow run from this specific commit."
+
+**Recommendation:** add `actions/attest-build-provenance@<sha>` after GoReleaser runs, targeting `dist/agent-vault_*_*.tar.gz` and the Docker digests. Update the release footer with `gh attestation verify` instructions.
+
+**F12 — Mutable `:latest` tag** (low, by design)
+
+`.goreleaser.yml:110-113` republishes `infisical/agent-vault:latest` every release. Standard practice but worth documenting: anyone pinning `:latest` in production is implicitly trusting every future release. The README should nudge users toward `:{version}` or, better, `:{version}@sha256:...` digest pinning. Unrelated to the signing gap in F9 — fixing F9 lets consumers pin-and-verify.
+
+**Recommendation:** add a "Pin by digest" section to the install/Docker docs; optionally enable tag-immutability on Docker Hub for `:{version}-*` tags.
+
+**F13 — Cosign verification regex is too broad** (low, informational)
+
+The release footer (`.goreleaser.yml:130-134`) tells users to verify with:
+```
+--certificate-identity-regexp "github.com/Infisical/agent-vault"
+```
+This matches *any* workflow in the org/repo whose identity URL contains that substring — including hypothetical future workflows that might not be release-related. Better to pin the exact release workflow identity.
+
+**Recommendation:** switch to:
+```
+--certificate-identity "https://github.com/Infisical/agent-vault/.github/workflows/release.yml@refs/tags/{{ .Tag }}"
+```
+(goreleaser can template the tag at release time, producing a per-release verification command.)
+
+**F14 — Base images not pinned by digest** (medium)
+
+`Dockerfile.goreleaser:2` (`FROM alpine:3.21`), `Dockerfile:2` (`FROM node:22-alpine`), `Dockerfile:11` (`FROM golang:1.25-alpine`), and `Dockerfile:29` (`FROM alpine:3.21`) are all pinned to floating tags. A compromised or repushed upstream tag would silently land in the release image. Equivalent to pinning a GitHub Action by `@v6` instead of `@<sha>` — the fix we've already applied on the Actions side.
+
+**Recommendation:** pin each with `@sha256:<digest>` (resolve via `docker buildx imagetools inspect alpine:3.21`). Dependabot's `docker` ecosystem will keep them updated if added to `.github/dependabot.yml` (cross-ref Section 3).
+
 ---
 
 ## Newly added tasks
@@ -184,3 +269,6 @@ All four `actions/checkout` invocations (ci.yml x2, release.yml x1, release-node
 - [ ] Audit the floating `version: "~> v2"` on goreleaser-action + `version: v2.11` on golangci-lint-action — consider pinning the tool binary too (low prio)
 - [ ] Consider adding zizmor to CI as a recurring check (uv tool install zizmor; run against `.github/`)
 - [ ] Generalise F6: audit **every** package/dependency manager config in the repo for cooldown / delay settings, not just Dependabot. Candidates to check: Renovate (`renovate.json` / `.renovaterc*`), npm (`package.json` → `overrides`, `.npmrc`), Go (`go.mod` `toolchain` directive, any `tools.go`), Docker base-image auto-updaters, pre-commit hook update schedules, and any third-party bot configs under `.github/`. Flag any that can auto-merge or auto-bump without a waiting window.
+- [ ] Verify Docker Hub repository settings: tag immutability on versioned tags, two-factor auth on the publishing account, scoped access token for `DOCKERHUB_TOKEN` (repo:write on `infisical/agent-vault` only) — cross-ref F12
+- [ ] Confirm npmjs trusted-publisher config for `@infisical/agent-vault-sdk` is scoped to `.github/workflows/release-node-sdk.yml` on this repo only
+- [ ] Investigate `Dockerfile:21` — `COPY --from=frontend /internal/server/webdist ...` looks like it copies from an absolute path in the frontend stage that doesn't exist (WORKDIR is `/app`). Likely a latent build-correctness bug, out of scope for security but worth flagging separately.
