@@ -33,12 +33,12 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 
 ## 3. Supply chain — dependencies
 
-- [ ] `go.mod` / `go.sum`: replace directives reviewed, Go toolchain pinned, `-mod=readonly`
-- [ ] Node SDK: lockfile present, `npm ci` in CI, no hostile install scripts in deps
-- [ ] Frontend `web/`: lockfile + Dependabot + audit coverage
-- [ ] `.github/dependabot.yml` covers: gomod, npm (web), npm (sdks/node), github-actions, docker
-- [ ] Vuln scanning in CI: `govulncheck`, `npm audit` / `osv-scanner`
-- [ ] `skills-lock.json`: source provenance + integrity check of embedded skills
+- [x] `go.mod` / `go.sum`: replace directives reviewed, Go toolchain pinned, `-mod=readonly` — `[!]` see F19 (toolchain)
+- [x] Node SDK: lockfile present, `npm ci` in CI, no hostile install scripts in deps — cross-ref F5, F18
+- [x] Frontend `web/`: lockfile + Dependabot + audit coverage
+- [x] `.github/dependabot.yml` covers: gomod, npm (web), npm (sdks/node), github-actions, docker — `[!]` see F16
+- [x] Vuln scanning in CI: `govulncheck`, `npm audit` / `osv-scanner` — `[!]` see F15
+- [x] `skills-lock.json`: source provenance + integrity check of embedded skills — `[!]` see F17
 
 ## 4. Container & install supply chain
 
@@ -263,6 +263,97 @@ This matches *any* workflow in the org/repo whose identity URL contains that sub
 
 ---
 
+### Section 3 — Supply chain (dependencies)
+
+**Positives (what's already right)**
+
+- `go.mod` has **zero replace directives** — no local path overrides, no forked imports, no unexpected redirects.
+- Direct Go dependency list is modest (11 entries) and drawn from reputable authors (`charmbracelet/*`, `fatih/color`, `spf13/cobra`, `golang.org/x/*`, `modernc.org/sqlite`).
+- CI runs `go mod tidy && git diff --exit-code go.mod go.sum` (`.github/workflows/ci.yml:35`) — catches stealth additions and uncommitted tidies.
+- All three Node projects ship a `package-lock.json` (lockfile version 3).
+- CI and `make web` / `make sdk-ts` both use `npm ci` (not `install`) — only the npm-publish workflow violates this (F5).
+- `actions/setup-go` uses `go-version-file: go.mod`, so CI builds with the exact Go version declared (currently 1.25.0).
+
+**Go direct-deps inventory**
+
+| Module | Purpose | Vendor |
+|---|---|---|
+| `charmbracelet/huh`, `lipgloss`, `bubbletea` (indirect) | Interactive TUI | Charm (reputable) |
+| `fatih/color` | Terminal colour | Long-established |
+| `jedib0t/go-pretty/v6` | Table rendering | Community-vetted |
+| `muesli/reflow` | Text wrapping | Charm-adjacent |
+| `spf13/cobra` | CLI framework | De facto standard |
+| `golang.org/x/{crypto,oauth2,term}` | std-x | Go team |
+| `gopkg.in/yaml.v3` | YAML parsing | go-yaml (v3 only) |
+| `modernc.org/sqlite` | Pure-Go SQLite | Pure-Go build (avoids CGO attack surface) |
+
+No obvious typosquats or abandoned projects.
+
+---
+
+**F15 — No vulnerability scanning in CI** (medium, supply-chain)
+
+`grep -rE 'govulncheck|osv-scanner|npm audit|snyk|trivy|grype'` across `.github/`, `scripts/`, `Makefile` returns zero hits. Dependabot opens update PRs, but it doesn't fail builds on known CVEs in the *current* lockfile; a critical vulnerability in a pinned transitive dep can sit unnoticed until a human checks.
+
+**Recommendation:** add three cheap gates to `ci.yml`:
+1. **`govulncheck`** (Go) — `go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...`. Scans against the Go vuln DB, only flags reachable vulns.
+2. **`osv-scanner`** (all lockfiles) — one pass over `go.sum`, `web/package-lock.json`, `sdks/sdk-typescript/package-lock.json`. Runs as `google/osv-scanner-action`.
+3. **`trivy` or `grype`** for the `Dockerfile` images once F14 digest-pinning lands.
+
+Either fail the build on findings above a threshold, or run as advisory but surface in PR summaries via `github/codeql-action/upload-sarif`.
+
+**F16 — Dependabot missing coverage for `sdks/sdk-typescript` and `docker`** (medium, supply-chain)
+
+`.github/dependabot.yml` covers `gomod /`, `npm /web`, and `github-actions /`. It does **not** cover:
+
+- **`npm /sdks/sdk-typescript`** — the published SDK package has no auto-updates. Combined with F5 (`npm install` at publish), this SDK's transitive deps can drift undetected.
+- **`docker`** — `Dockerfile`, `Dockerfile.goreleaser`. Once F14 is fixed (digest-pinning), Dependabot's `docker` ecosystem is the only low-friction way to keep those digests current.
+
+**Recommendation:** append to `.github/dependabot.yml`:
+```yaml
+  - package-ecosystem: npm
+    directory: /sdks/sdk-typescript
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+
+  - package-ecosystem: docker
+    directories:
+      - /
+      - /   # Dockerfile.goreleaser also at root
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+```
+Note: Dependabot's `docker` ecosystem reads `Dockerfile` by default; to cover `Dockerfile.goreleaser` specifically, you may need a `file` or `target-branch` override, or rename it to a pattern Dependabot auto-discovers.
+
+**F17 — `skills-lock.json` is orphaned (dead integrity mechanism)** (informational)
+
+`skills-lock.json` declares a `mintlify` skill with `computedHash` (sha256), but **no Go code reads the file** — the sub-agent trace confirmed skills are in fact `go:embed`ed from `cmd/skill_cli.md` / `cmd/skill_http.md` (see `cmd/run.go:23-27`) and served from embedded bytes at `/v1/skills/{cli,http}`. The lockfile is vestigial — probably left over from a planned trusted-publishing / remote-skill-fetch feature.
+
+Consequence: a reviewer who sees `skills-lock.json` may incorrectly assume it enforces integrity of embedded skills. It doesn't. Skill integrity is currently guaranteed only by the fact that `cmd/skill_*.md` is in the git tree and embedded at build time — so the real integrity gate is *git branch protection + release provenance* (cross-ref F11).
+
+**Recommendation:** either (a) delete `skills-lock.json` and the "computedHash" idea until a loader lands, or (b) wire it up — add a build-time check that the computed hash of each embedded `cmd/skill_*.md` matches `skills-lock.json`, failing `make build` on drift. Option (a) is cheaper given there's no remote-fetch code path.
+
+**F18 — npm install scripts allowed in lockfiles (esbuild, fsevents)** (informational)
+
+Both `web/package-lock.json` and `sdks/sdk-typescript/package-lock.json` include `esbuild` and `fsevents`, both with `"hasInstallScript": true`. `esbuild`'s postinstall downloads a platform-specific prebuilt binary outside the lockfile integrity scope; `fsevents` is a macOS-only native module. These are legitimate and hard to remove (esbuild is a dep of vite/tsup). But it does mean the lockfile's integrity hashes don't fully cover what lands on disk after `npm ci`.
+
+**Recommendation:** this is inherent to the toolchain; accept and document. If desired, pin esbuild to a specific version and trust the pattern. Do **not** add `--ignore-scripts` broadly — esbuild won't function without its postinstall binary download.
+
+**F19 — `go.mod` lacks an explicit `toolchain` directive** (low)
+
+`go.mod:3` declares `go 1.25.0` (a minimum), without a `toolchain go1.25.x` line that would pin the exact Go toolchain version. `actions/setup-go` with `go-version-file: go.mod` resolves the `go` directive as the version to install, so CI is deterministic today — but a future Go that honors the `toolchain` directive more strictly, or a developer running `go build` locally on a different Go version, could produce slightly different output. Minor reproducibility gap.
+
+**Recommendation:** add `toolchain go1.25.5` (or whichever patch you standardise on) to `go.mod`, and let Dependabot keep it fresh.
+
+---
+
 ## Newly added tasks
 
 - [ ] Verify tag protection rules on `v*` and `node-sdk/v*.*.*` (repo setting — may need to ask user; cross-ref F2)
@@ -272,3 +363,5 @@ This matches *any* workflow in the org/repo whose identity URL contains that sub
 - [ ] Verify Docker Hub repository settings: tag immutability on versioned tags, two-factor auth on the publishing account, scoped access token for `DOCKERHUB_TOKEN` (repo:write on `infisical/agent-vault` only) — cross-ref F12
 - [ ] Confirm npmjs trusted-publisher config for `@infisical/agent-vault-sdk` is scoped to `.github/workflows/release-node-sdk.yml` on this repo only
 - [ ] Investigate `Dockerfile:21` — `COPY --from=frontend /internal/server/webdist ...` looks like it copies from an absolute path in the frontend stage that doesn't exist (WORKDIR is `/app`). Likely a latent build-correctness bug, out of scope for security but worth flagging separately.
+- [ ] Decide resolution for F17 `skills-lock.json` — either delete or wire up the integrity check in `make build`.
+- [ ] Once F15 lands, decide fail-threshold policy for vuln scanners (hard-fail on high/critical vs advisory comments on PRs).
