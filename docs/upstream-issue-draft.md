@@ -21,7 +21,7 @@ Before I send anything as PRs, I wanted to check which (if any) you'd welcome. E
 
 1. **Dependabot cooldown** — catches freshly-published malicious versions before they land in auto-PRs.
 2. **`npm install` → `npm ci` in `release-node-sdk.yml`** — installs strictly from the lockfile, closing the window between what CI tested and what ships to npm. The exact vector the Axios compromise exploited.
-3. **Drop redundant `contents: write`** on the node-sdk publish workflow — the publish job only needs `id-token: write` for OIDC.
+3. **Downgrade `contents: write` → `contents: read`** on the node-sdk publish workflow — checkout needs `contents: read`; OIDC publish needs `id-token: write`; nothing in the job writes to the repo. (Can't *remove* the `contents:` line entirely — any declared `permissions:` block forces unspecified permissions to `none`, which would break checkout.)
 4. **`persist-credentials: false`** on `actions/checkout` — found by `zizmor` (artipacked). No `git push` happens in any workflow, so the `GITHUB_TOKEN` doesn't need to be left in `.git/config`.
 5. **`--proto '=https'`** on `install.sh` curl calls — defense-in-depth against HTTP redirect downgrade.
 6. **Pin Dockerfile base images by digest** and enable Dependabot's `docker` ecosystem — floating tags (`alpine:3.21`, `node:22-alpine`, `golang:1.25-alpine`) are mutable upstream; a retag or compromise lands silently in the next build. Digest pinning (`@sha256:...`) makes base-image changes opt-in; the Dependabot docker ecosystem keeps the pins fresh so they don't rot.

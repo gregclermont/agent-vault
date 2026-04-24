@@ -114,7 +114,7 @@ Cheap, non-urgent, close out in a single PR each.
 
 | # | Finding | Type | Action |
 |---|---|---|---|
-| 21 | F1 | **[PR]** | Drop `contents: write` on `release-node-sdk.yml`; move all release permissions to job level. |
+| 21 | F1 | **[PR]** | Downgrade `contents: write` → `contents: read` on `release-node-sdk.yml` (checkout still needs `contents: read`; removing the line entirely defaults unspecified perms to `none`). Move both `contents: read` and `id-token: write` to the job level rather than workflow level. |
 | 22 | F3 | **[PR]** | Add `concurrency: { group: release-${{ github.ref }}, cancel-in-progress: false }` to release workflows. |
 | 23 | F7 | **[PR]** | Disable language caches on release jobs (`cache: false` on setup-go / setup-node inside `release.yml`). |
 | 24 | F8 | **[PR]** | `persist-credentials: false` on every `actions/checkout`. |
@@ -278,7 +278,13 @@ You can materially reduce your risk without waiting on the maintainers. None of 
 
 `.github/workflows/release-node-sdk.yml:11` grants `contents: write`, but the only job runs `npm publish`; it never creates a GitHub release, pushes commits, or tags. `contents: read` is sufficient.
 
-**Recommendation:** drop to `contents: read`.
+**Recommendation:** downgrade to `contents: read` (not remove the line — once a `permissions:` block is declared, any unspecified permissions default to `none`, and `actions/checkout` needs at least `contents: read` to clone the repo). Final result:
+```yaml
+permissions:
+  contents: read     # for actions/checkout
+  id-token: write    # for NPM OIDC publish
+```
+Better still, move both lines to the job level (this repo only has one job today, but job-scoping prevents future sibling jobs from inheriting the `id-token: write` scope — a zizmor `excessive-permissions` cleanup that applies to `release.yml` too, per the cross-check below).
 
 **F2 — No `environment:` gating on release workflows** (medium)
 
