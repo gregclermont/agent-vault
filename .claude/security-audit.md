@@ -183,3 +183,4 @@ All four `actions/checkout` invocations (ci.yml x2, release.yml x1, release-node
 - [ ] Verify tag protection rules on `v*` and `node-sdk/v*.*.*` (repo setting — may need to ask user; cross-ref F2)
 - [ ] Audit the floating `version: "~> v2"` on goreleaser-action + `version: v2.11` on golangci-lint-action — consider pinning the tool binary too (low prio)
 - [ ] Consider adding zizmor to CI as a recurring check (uv tool install zizmor; run against `.github/`)
+- [ ] Generalise F6: audit **every** package/dependency manager config in the repo for cooldown / delay settings, not just Dependabot. Candidates to check: Renovate (`renovate.json` / `.renovaterc*`), npm (`package.json` → `overrides`, `.npmrc`), Go (`go.mod` `toolchain` directive, any `tools.go`), Docker base-image auto-updaters, pre-commit hook update schedules, and any third-party bot configs under `.github/`. Flag any that can auto-merge or auto-bump without a waiting window.
