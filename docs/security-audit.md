@@ -698,17 +698,28 @@ Post-audit probe of publicly-observable release artifacts. Sandbox egress is res
 
 Also: `:latest` IS being published and overwritten per release (confirms F12's description of the mutable-by-design behaviour).
 
-**`agent-vault.dev` / `get.agent-vault.dev` — BLOCKED by sandbox egress**
+**`agent-vault.dev` / `get.agent-vault.dev` — partially verified off-sandbox**
 
-Attempted DoH against `cloudflare-dns.com` (CAA, DS, NS) → 403 from sandbox egress filter. Direct HTTPS to `agent-vault.dev` → host doesn't resolve via sandbox DNS (though `get.agent-vault.dev` does, via TLS-inspecting proxy). HSTS-preload API (`hstspreload.org`) → 403. **Could not verify DNSSEC, CAA records, HSTS preload status, or HSTS headers from this environment.**
+Off-sandbox run of the four-command probe (ISP resolver is NextDNS):
 
-These checks remain open — a single command outside the sandbox would close them:
-```sh
-dig +dnssec agent-vault.dev NS DS
-dig CAA agent-vault.dev
-curl -sI https://get.agent-vault.dev/ | grep -i strict-transport-security
-curl -s 'https://hstspreload.org/api/v2/status?domain=agent-vault.dev' | jq .status
-```
+| Check | Result | Interpretation |
+|---|---|---|
+| `dig +dnssec agent-vault.dev NS DS` | CNAME `blockpage.nextdns.io` — "Blocked by NextDNS: `nrd~month`" | **Domain is <1 month old** per NextDNS's Newly-Registered-Domains list. DNSSEC/NS/DS couldn't be read from this resolver. |
+| `dig CAA agent-vault.dev` | Same NRD block | Couldn't be read from this resolver. |
+| `curl -sI https://get.agent-vault.dev/` → grep STS | Empty | Ambiguous — likely also NRD-blocked at the DNS layer, so curl hit the block page (which wouldn't carry HSTS). Re-run from a non-filtering resolver needed to confirm real STS header presence. |
+| `curl ... hstspreload.org/api/v2/status?domain=agent-vault.dev` → `.status` | `"preloaded"` | **✅ Strong finding.** `agent-vault.dev` is in the HSTS preload list shipped with Chrome/Firefox/Safari/Edge. Browsers refuse HTTP to this domain before ever receiving a header. Best-case HSTS posture for browser clients. |
+
+**Two new findings from this probe, folded into F24:**
+
+- **F24a (positive)** — HSTS preload is active. Remove the "verify HSTS preload" sub-item from F24; it's done.
+- **F24b (informational)** — the installer domain is brand-new (NextDNS flagged it as `nrd~month`). Two operational implications:
+  1. Enterprises with NRD-blocking DNS (NextDNS, DNSFilter, Cisco Umbrella, corporate malware-domain lists) will actively *block* `curl | sh` installs for the first 30-90 days. Documentation should mention a non-`curl|sh` fallback for those environments (dovetails with the "signed install alternatives" follow-up already logged).
+  2. As the domain ages out of NRD lists, this self-resolves — but that window is *now* for the audit.
+
+Still open (needs a non-NRD-filtering resolver — e.g., `dig @1.1.1.1 ...`):
+- DNSSEC (`+dnssec`) AD-flag + chain verification
+- CAA records (any issuer pinning?)
+- Runtime STS header on `get.agent-vault.dev/` (relevant for non-browser installers like `curl | sh` that don't consult the preload list)
 
 ---
 
@@ -721,7 +732,8 @@ curl -s 'https://hstspreload.org/api/v2/status?domain=agent-vault.dev' | jq .sta
 - [ ] Investigate `Dockerfile:21` — `COPY --from=frontend /internal/server/webdist ...` looks like it copies from an absolute path in the frontend stage that doesn't exist (WORKDIR is `/app`). Likely a latent build-correctness bug, out of scope for security but worth flagging separately.
 - [ ] Decide resolution for F17 `skills-lock.json` — either delete or wire up the integrity check in `make build`.
 - [ ] Once F15 lands, decide fail-threshold policy for vuln scanners (hard-fail on high/critical vs advisory comments on PRs).
-- [ ] Verify `agent-vault.dev` / `get.agent-vault.dev` infrastructure (F24): DNSSEC, CAA records, HSTS preload, source-of-truth for the served `install.sh` (ideally an in-repo file at a pinned commit, not a mutable bucket). *(Attempted from this session's sandbox — blocked by egress allowlist. Commands to run outside the sandbox are in the "External verification" section.)*
+- [~] Verify `agent-vault.dev` / `get.agent-vault.dev` infrastructure (F24). **HSTS preload: confirmed active (F24a).** Still open: DNSSEC chain + CAA records + runtime STS header (retry via `dig @1.1.1.1` / `dig @8.8.8.8` to bypass the NRD filter that blocked the first attempt), plus the source-of-truth for the served `install.sh` (ideally an in-repo file at a pinned commit).
+- [ ] **F24b (new, informational)** — `agent-vault.dev` is a Newly-Registered Domain per NextDNS (<1 month old as of 2026-04-24). Corporate NRD-blocking resolvers will block `curl | sh` installs for 30-90 days. Offer a non-curl-pipe alternative in the meantime (pairs with the "signed install alternatives" follow-up).
 - [ ] Once F20 lands, update README's install instructions to reflect the verification step + mention the optional cosign path.
 - [ ] Consider offering a verification-only mode (`install.sh --verify-only`) and a per-platform install via Homebrew / a signed `.pkg` for macOS / `apt` repo for Debian — as alternatives to `curl | sh` for security-conscious users.
 - [ ] Verify **upstream** `Infisical/agent-vault` branch + tag protection settings (F27 is phrased against the `gregclermont/agent-vault` mirror that this session has MCP access to). Re-check on upstream before treating F27 as actionable.
