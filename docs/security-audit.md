@@ -39,7 +39,9 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 | F24 | info | install | `get.agent-vault.dev` root-of-trust (out-of-repo) |
 | F25 | info | install | Installer doesn't fetch the SBOM |
 | F26 | low | install | `curl` missing `--proto '=https'` |
-| F27 | **high** | repo | `main` branch is not protected (verify upstream) |
+| F27 | medium | repo | Branch protection active upstream but bypassed by maintainer on own commits *(revised from high after off-sandbox probe)* |
+| F27a | medium | repo | No tag-protection ruleset upstream — `v*` / `node-sdk/v*.*.*` unprotected |
+| F27b | low | repo | Commit+tag signing not required (74% commits, 40% tags currently signed) |
 | F28 | medium | repo | No CODEOWNERS file |
 | F29 | low | repo | No signed-commit / DCO enforcement |
 | F30 | medium | repo | `GO_RELEASER_GITHUB_TOKEN` likely a PAT with cross-repo scope |
@@ -49,10 +51,11 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 | F34 | medium | project | Frontend supply chain reaches Go binary via `go:embed` |
 | F35 | info | project | Other `go:embed`ed content (emails, migrations, sandbox assets) |
 
-**Three high-severity findings — fix order:**
+**Two high-severity findings — fix order:**
 1. **F20** (install.sh skips verification) — highest blast radius: one compromise → every install backdoored.
-2. **F27** (main is unprotected) — undermines PR-review assumption that F33/F34/F28 rely on.
-3. **F9** (images not signed) — parity with F20 on the container install path.
+2. **F9** (images not signed) — parity with F20 on the container install path.
+
+*F27 was initially rated high based on the gregclermont mirror's `protected: false`, but the off-sandbox probe against upstream confirmed that `main` is protected (5 rule types across 2 active rulesets). Downgraded to medium — the remaining gap is the maintainer bypassing their own ruleset (see F27 writeup), plus F27a (no tag protection) and F27b (signing not required).*
 
 ---
 
@@ -84,11 +87,12 @@ Shai-Hulud and Axios both proceeded via compromised maintainer accounts → push
 
 | # | Finding | Type | Action |
 |---|---|---|---|
-| 9 | F27 | **[CONFIG]** | Enable branch protection on `main`: required reviews, required status checks, no force-push, linear history, signed commits (ties to F29). |
-| 10 | F28 | **[PR]** | Add `CODEOWNERS` covering workflows, release config, crypto/auth/oauth/session, embedded-trust paths (`cmd/skill_*.md`, `persistent_instructions_admin.txt`, email templates, SQL migrations, sandbox assets). Draft policy in F28 writeup. |
-| 11 | F2 | **[BOTH]** | PR adds `environment: release` to release workflows. Maintainer creates the environment with required reviewers + tag-pattern deployment restrictions, moves secrets to it. |
-| 12 | *tag protection* | **[CONFIG]** | Tag protection rules on `v*` and `node-sdk/v*.*.*`. Prevents non-admins from cutting releases even if they land a bad commit. |
-| 13 | F30 | **[CONFIG]** | Migrate `GO_RELEASER_GITHUB_TOKEN` from a personal PAT to a **GitHub App installation token** scoped to `Infisical/homebrew-get-cli` `contents:write` only. Shai-Hulud-class risk: a PAT on any maintainer's laptop is one `npm install` away from being exfiltrated. |
+| 9 | F27a | **[CONFIG]** | **Add a tag-protection ruleset** for `v*` and `node-sdk/v*.*.*` with `creation`, `deletion`, `non_fast_forward` rules and an empty bypass list. Upstream has branch protection on `main` but nothing on tags, so tag push = release without any gate beyond who has push. |
+| 10 | F27 (remaining) | **[CONFIG]** | **Remove maintainer bypass** from both active branch rulesets (org-wide `8667238` and repo-local `14481526`). Off-sandbox probe showed 9/9 recent `main` commits by the primary maintainer skipped the `pull_request` rule — classic Shai-Hulud target. Require a co-reviewer even for maintainer commits. |
+| 11 | F28 | **[PR]** | Add `CODEOWNERS` covering workflows, release config, crypto/auth/oauth/session, embedded-trust paths (`cmd/skill_*.md`, `persistent_instructions_admin.txt`, email templates, SQL migrations, sandbox assets). Draft policy in F28 writeup. |
+| 12 | F2 | **[BOTH]** | PR adds `environment: release` to release workflows. Maintainer creates the environment with required reviewers + tag-pattern deployment restrictions, moves secrets to it. |
+| 13 | F27b | **[CONFIG]** | Add `required_signatures` rule to both branch and (new) tag rulesets. Upstream currently at 74% commit / 40% tag signing — encouraged but not enforced. Tag signing in particular matters for release provenance. |
+| 14 | F30 | **[CONFIG]** | Migrate `GO_RELEASER_GITHUB_TOKEN` from a personal PAT to a **GitHub App installation token** scoped to `Infisical/homebrew-get-cli` `contents:write` only. Shai-Hulud-class risk: a PAT on any maintainer's laptop is one `npm install` away from being exfiltrated. |
 
 ### Tier 3 — dependency supply chain (the Shai-Hulud / Axios ingress paths)
 
@@ -656,37 +660,66 @@ curl --proto '=https' --proto-redir '=https' -fsSL ...
 
 ---
 
-**F27 — `main` branch protection gaps (observable without admin access)** (**high**)
+**F27 — branch protection is active upstream, but bypassed on maintainer's own commits** (medium — revised from initial "high")
 
-`mcp__github__list_branches` on `gregclermont/agent-vault` returns `"protected": false` for both `main` and the audit branch. That's the boolean from the public branches endpoint — available to any anonymous caller on a public repo.
+Initial framing (based on `gregclermont/agent-vault` mirror returning `protected: false`) was: no protection at all. **That was misleading** — the mirror doesn't replicate upstream org/repo settings. Off-sandbox probe against `Infisical/agent-vault` returns the real picture:
 
-Going one level deeper, `mcp__github__list_commits` on `main` reveals the actual merge discipline:
+- `GET /repos/Infisical/agent-vault/branches/main` → `"protected": true`.
+- `GET /repos/Infisical/agent-vault/rules/branches/main` returns **5 applied rule types from 2 rulesets** (one org-wide "Default ruleset" id `8667238`, one repo-local "main branch protection" id `14481526`):
 
-| # | sha | author | committer.login | Pattern |
-|---|---|---|---|---|
-| 1 | `fdf011e` | Tuan Dang | `dangtony98` | **direct push** — committer is the author, not `web-flow` |
-| 2 | `c5df043` | Tuan Dang | `dangtony98` | **direct push** |
-| 3 | `2b8e020` | BlackMagiq | `web-flow` | PR merge (#103) — `web-flow` committer signature |
-| 4 | `c8b6461` | BlackMagiq | `web-flow` | PR merge (#102) |
-| 5 | `5f3e36f` | Chris | `web-flow` | PR merge (#101) |
+  | Rule type | Source |
+  |---|---|
+  | `pull_request` | org + repo (double-layered) |
+  | `required_status_checks` | repo |
+  | `non_fast_forward` (no force-push) | org + repo |
+  | `deletion` (can't delete main) | org + repo |
+  | `required_linear_history` | repo |
 
-The top two commits on `main` have `committer.login = <human>` rather than `web-flow` (id `19864447`, the GitHub UI merge agent). That's the fingerprint of `git push origin main` — the commits never went through a PR.
+That's a structurally hardened setup — force-push blocked, deletion blocked, PR review required, CI required, linear history.
 
-**What this directly proves:**
-- Direct pushes to `main` are allowed and occurring (2/5 recent commits).
-- No required PR review gate.
-- (Force-push enablement is harder to confirm from outside — admin-only via `/branches/{branch}/protection` — but "no branch protection" almost always means force-push is on.)
+**But the merge discipline doesn't match.** Inspecting 9 consecutive recent commits on `main`:
 
-**Upstream implication:** the mirror presumably reflects upstream state, so the pattern is likely the same on `Infisical/agent-vault`. The user should re-run the two commands in the runbook below against upstream to confirm.
+- All 9 have `author.login == committer.login == dangtony98`.
+- None have `(#NNN)` PR numbers in commit messages.
+- Contrast with the *other* pattern visible on the mirror: when external contributors merge, the committer flips to `web-flow` with `(#NNN)` in the title.
 
-**Why this matters:** this is the mitigation that half the findings in this audit depend on. F2 (release environment gating), F20 (installer verification), F33/F34 (tamper paths into embedded content) all rely on "merges to `main` are reviewed." Without branch protection, those controls degrade to "anyone on the commit bit can bypass everything." Shai-Hulud-class attacks *specifically* rely on the absence of branch protection — a maintainer account compromise straight-lines into an unreviewed push.
+On a branch where `pull_request` is a required rule, the only ways this can happen are:
 
-**Recommendation (for upstream maintainers):**
-- Require at least 1 review (ideally 2 for release-touching paths — see F28).
-- Require status checks: `test`, `lint`, the planned zizmor + vuln-scan jobs from F15.
-- Disallow force-push and deletion.
-- Enforce linear history.
-- Enable **tag protection rules** for `v*` and `node-sdk/v*.*.*` so only admins can create release tags (cross-ref F2).
+1. **The maintainer is a bypass actor on both rulesets** (most likely). Rulesets support per-actor bypass allowlists, and it's a common pattern for the primary maintainer to hold one on their own projects.
+2. PRs are being rebase-merged in a way that preserves the original committer *and* strips `(#NNN)` from titles. Rare.
+3. These went through PRs whose titles happen to omit `(#NNN)`. Unlikely given the clean binary pattern.
+
+**Severity implication:** structural protection blocks the *external* compromise paths (a contributor can't push to `main` without a PR). It does not block the *Shai-Hulud-class* path — if the primary maintainer's account or laptop is compromised, the compromised identity inherits the bypass and can push to `main` directly, skipping review. Given the 2025-2026 incident landscape (Axios, Shai-Hulud, tj-actions), this is the more-exploited path.
+
+**Disambiguation (safe off-sandbox probe):**
+```sh
+# For the top 10 main commits, list PRs that include each one.
+# Empty arrays = direct-push confirmation; populated = PR-merged.
+for sha in $(curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/commits?sha=main&per_page=10" | jq -r '.[].sha'); do
+    printf "%s  " "${sha:0:8}"
+    curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/commits/$sha/pulls" \
+        | jq -r 'if length == 0 then "DIRECT PUSH" else map("#\(.number)") | join(",") end'
+done
+```
+
+**Recommendation for upstream maintainers:**
+- Remove the maintainer from the ruleset bypass allowlist (admin-only in repo settings → Rules → Rulesets → edit → Bypass list). Self-review via a second maintainer or a dedicated reviewer team is the standard alternative.
+- If self-bypass is needed for emergencies (legitimate use case), gate it behind a second factor: require signed commits (see F27b), or require a `security-emergency` label, or configure bypass as "pull request only" rather than "always."
+- Add a `tag` ruleset covering `v*` and `node-sdk/v*.*.*` (see F27c).
+
+**F27a — Tag protection is not configured upstream** (medium)
+
+Both active rulesets target `branch`. No `tag`-targeted ruleset appears in `/repos/Infisical/agent-vault/rulesets`. Anyone with push access can therefore push a `v*` or `node-sdk/v*.*.*` tag on any commit, which triggers `release.yml` / `release-node-sdk.yml` with the full release-secret surface (Docker Hub, Homebrew PAT, npm OIDC). Tag protection closes the "malicious release" vector independently of branch protection.
+
+**Recommendation:** create a ruleset with `target: "tag"`, `conditions.ref_name.include: ["refs/tags/v*", "refs/tags/node-sdk/v*.*.*"]`, `rules: [{"type": "creation"}, {"type": "deletion"}, {"type": "non_fast_forward"}]`, and `bypass_actors: []` (no exceptions — release tags are a strictly admin operation).
+
+**F27b — Commit and tag signing are not required** (low)
+
+User-supplied verification stats from off-sandbox probe: **26/35 (~74%) commits** on recent `main` are verified-signed; **4/10 (40%) recent tags** are verified. `required_signatures` is not in the applied-rule list for either of the active rulesets. Signing is therefore encouraged-but-not-enforced.
+
+For a credential-broker project, tag signing in particular should be enforced: unsigned tags undermine cosign's chain of provenance (users verifying a release have no way to know the tag itself wasn't created by an unauthorised party even if they *think* branch protection covered the pre-tag commits).
+
+**Recommendation:** add `{"type": "required_signatures"}` to the repo-local ruleset (applies to both `main` commits and to the tag ruleset from F27a once that's created). Maintainers will need to set up commit signing (`git config commit.gpgsign true` + YubiKey or similar) if they haven't already.
 
 **F28 — No CODEOWNERS** (medium)
 
@@ -940,7 +973,18 @@ curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/git/tags/$TAG_SHA
 ```
 (Note: lightweight tags don't have tag objects; only annotated/signed tags do. An empty `git/tags/*` response means lightweight tags — i.e. no signing.)
 
-**7. PR review discipline.** Inspect merged PRs to verify reviews actually occurred:
+**7. Commit → PR association (bypass-actor disambiguation).** Given a `main` commit sha, which PRs include it? Empty = direct push / bypass:
+```sh
+# Check all recent main commits:
+for sha in $(curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/commits?sha=main&per_page=20" | jq -r '.[].sha'); do
+    printf "%s  " "${sha:0:8}"
+    curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/commits/$sha/pulls" \
+        | jq -r 'if length == 0 then "DIRECT PUSH (or bypass)" else map("#\(.number)") | join(",") end'
+done
+```
+Commits returning empty array landed on `main` without a PR. On a repo with an active `pull_request` rule, that means either a bypass actor or a ruleset mis-target.
+
+**8. PR review discipline.** Inspect merged PRs to verify reviews actually occurred:
 ```sh
 curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/pulls?state=closed&per_page=20" \
   | jq '.[] | select(.merged_at != null) | {number, title, author: .user.login, merged_by: .merged_by.login, requested_reviewers: [.requested_reviewers[]?.login]}'
@@ -950,7 +994,7 @@ curl -sSL "${H[@]}" "https://api.github.com/repos/$OWNER/$REPO/pulls/<PR#>/revie
 ```
 PRs where `merged_by == user` (self-merge) and there are zero `APPROVED` reviews indicate no required-review policy.
 
-**8. Ruleset bypass actors** (admin-only, but worth noting it's what you *can't* see): who's allowed to skip the rules (emergency-push roles, apps, individual bypass grants) is only readable to repo admins via `/repos/{owner}/{repo}/rulesets/{id}` with full read. If the PR-review count returns `null` in step 3, that's because the ruleset detail is gated.
+**9. Ruleset bypass actors** (admin-only, but worth noting it's what you *can't* see): who's allowed to skip the rules (emergency-push roles, apps, individual bypass grants) is only readable to repo admins via `/repos/{owner}/{repo}/rulesets/{id}` with full read. If the PR-review count returns `null` in step 3, that's because the ruleset detail is gated. However, **step 7 proves bypass-actor presence indirectly** without needing the admin endpoint: if a commit landed on `main` without an associated PR on a ruleset-protected branch, a bypass happened.
 
 **What's truly admin-only:**
 - Full branch-protection config: `required_approving_review_count`, `dismiss_stale_reviews`, `require_code_owner_reviews`, lock branch, etc.
