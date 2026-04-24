@@ -7,6 +7,55 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 
 ---
 
+## Findings summary
+
+**35 findings.** Fix F20 first, F27 second — they unlock or undermine most of the rest.
+
+| ID | Sev | Area | Finding |
+|---|---|---|---|
+| F1 | low | workflow | `contents: write` on `release-node-sdk.yml` unnecessary |
+| F2 | medium | workflow | No `environment:` gating on release workflows |
+| F3 | low | workflow | No `concurrency:` on release workflows |
+| F4 | info | workflow | Unquoted `${GITHUB_REF_NAME#...}` shell expansion |
+| F5 | medium | supply-chain | `npm install` instead of `npm ci` in publish job |
+| F6 | medium | supply-chain | Missing Dependabot `cooldown:` on all ecosystems |
+| F7 | low | workflow | Cache poisoning risk from shared language caches |
+| F8 | low | workflow | `actions/checkout` default `persist-credentials: true` |
+| F9 | **high** | release | Docker images are not cosign-signed |
+| F10 | medium | release | No SBOM attached to Docker images |
+| F11 | medium | release | No SLSA build provenance attestation |
+| F12 | low | release | `:latest` tag is mutable (by design; document) |
+| F13 | low | release | Cosign verify regex is too broad |
+| F14 | medium | container | Base images not pinned by digest |
+| F15 | medium | supply-chain | No vuln scanning in CI (`govulncheck`/`osv`/`trivy`) |
+| F16 | medium | supply-chain | Dependabot missing `sdks/sdk-typescript` and `docker` |
+| F17 | info | supply-chain | `skills-lock.json` is orphaned (dead integrity mechanism) |
+| F18 | info | supply-chain | npm install scripts (esbuild/fsevents) outside lockfile |
+| F19 | low | supply-chain | `go.mod` lacks explicit `toolchain` directive |
+| F20 | **high** | install | `install.sh` does not verify checksums or signatures |
+| F21 | medium | install | JSON parsed from GitHub API via `grep | sed` |
+| F22 | low | install | Anonymous GitHub API rate limit (reliability) |
+| F23 | low | install | Telemetry beacon fires before binary verification |
+| F24 | info | install | `get.agent-vault.dev` root-of-trust (out-of-repo) |
+| F25 | info | install | Installer doesn't fetch the SBOM |
+| F26 | low | install | `curl` missing `--proto '=https'` |
+| F27 | **high** | repo | `main` branch is not protected (verify upstream) |
+| F28 | medium | repo | No CODEOWNERS file |
+| F29 | low | repo | No signed-commit / DCO enforcement |
+| F30 | medium | repo | `GO_RELEASER_GITHUB_TOKEN` likely a PAT with cross-repo scope |
+| F31 | low | repo | No secret-scanning tooling in-repo |
+| F32 | low | project | Sensitive-internal tests run in fork-PR CI (mitigated) |
+| F33 | medium | project | Skill doc tamper path (agents trust embedded markdown) |
+| F34 | medium | project | Frontend supply chain reaches Go binary via `go:embed` |
+| F35 | info | project | Other `go:embed`ed content (emails, migrations, sandbox assets) |
+
+**Three high-severity findings — fix order:**
+1. **F20** (install.sh skips verification) — highest blast radius: one compromise → every install backdoored.
+2. **F27** (main is unprotected) — undermines PR-review assumption that F33/F34/F28 rely on.
+3. **F9** (images not signed) — parity with F20 on the container install path.
+
+---
+
 ## 1. GitHub Actions workflow hardening
 
 - [x] Action pinning: all third-party actions pinned to full commit SHA (not floating tags)
@@ -48,17 +97,17 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 
 ## 5. Repo & org-level controls (best-effort from repo contents)
 
-- [ ] Branch protection on `main` (inferable from workflow `if:` guards / required checks)
-- [ ] Tag protection / signed commits signals in repo
-- [ ] `CODEOWNERS` file covering workflows, release config, crypto/auth/oauth/session
-- [ ] Secret scanning / push protection hints (e.g., `.gitleaks`, pre-commit)
-- [ ] Any fine-grained PATs or deploy keys referenced in workflows
+- [x] Branch protection on `main` (inferable from workflow `if:` guards / required checks) — `[!]` see F27
+- [x] Tag protection / signed commits signals in repo — `[!]` see F29, cross-ref F2
+- [x] `CODEOWNERS` file covering workflows, release config, crypto/auth/oauth/session — `[!]` see F28
+- [x] Secret scanning / push protection hints (e.g., `.gitleaks`, pre-commit) — `[!]` see F31
+- [x] Any fine-grained PATs or deploy keys referenced in workflows — `[!]` see F30
 
 ## 6. Project-specific sensitive paths
 
-- [ ] Workflows touching `internal/crypto`, `internal/ca`, `internal/auth`, `internal/oauth`, `internal/session` with fork-PR code + secrets
-- [ ] Embedded skill docs (`cmd/skill_cli.md`, `cmd/skill_http.md`) tamper path
-- [ ] `web/` build → `go:embed` → Go binary: frontend supply-chain reaches the binary
+- [x] Workflows touching `internal/crypto`, `internal/ca`, `internal/auth`, `internal/oauth`, `internal/session` with fork-PR code + secrets — `[!]` see F32
+- [x] Embedded skill docs (`cmd/skill_cli.md`, `cmd/skill_http.md`) tamper path — `[!]` see F33
+- [x] `web/` build → `go:embed` → Go binary: frontend supply-chain reaches the binary — `[!]` see F34, F35
 
 ---
 
@@ -466,6 +515,157 @@ curl --proto '=https' --proto-redir '=https' -fsSL ...
 
 ---
 
+### Section 5 — Repo & org-level controls
+
+**Scope note:** GitHub MCP access in this session is limited to `gregclermont/agent-vault` — a mirror/fork of `Infisical/agent-vault`. Branch-protection and repo-setting findings below refer to the mirror; the upstream may have different settings. The upstream repo is the one users actually install from, so these findings are phrased as "verify on upstream."
+
+**Positives (what's already right)**
+
+- `SECURITY.md` is present with a clear vuln-reporting channel (`security@infisical.com`) and the correct "don't open public issues" guidance.
+- `.github/pull_request_template.md` includes a **Security checklist** (no secrets, no unauth endpoints, input validation, OWASP top-10). Not enforced, but a good nudge during PR authoring.
+- `.gitignore` explicitly blocks common secret-file patterns: `.env`, `.env.*`, `*.key`, `*.pem`, `*.p12`, `*.pfx`, `credentials.json`, `secrets.yaml`. Defence-in-depth against accidental commits.
+- Only four distinct secrets are referenced across all workflows: `GITHUB_TOKEN` (built-in), `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `GO_RELEASER_GITHUB_TOKEN`. No deploy keys, no SSH key references, no exotic cloud creds.
+
+---
+
+**F27 — `main` branch is not protected** (**high**)
+
+`mcp__github__list_branches` on `gregclermont/agent-vault` returns `"protected": false` for both `main` and the audit branch. Taken at face value, this means:
+- Direct pushes to `main` are allowed (no required PR review).
+- No required CI status checks before merge.
+- Force-push to `main` is permitted.
+- Anyone with push access can ship arbitrary code that will then be picked up by the release pipeline on the next tag.
+
+**This is the upstream mitigation for half the findings in this audit** — F2 (release environment gating), F20 (installer verification), F33/F34 (tamper paths into embedded content) all rely on "merges to main are reviewed." Without branch protection, those controls degrade to "anyone on the commit bit can bypass everything."
+
+**Recommendation (to confirm on upstream `Infisical/agent-vault`):**
+- Require at least 1 review (ideally 2 for release-touching paths — see F28).
+- Require status checks: `test`, `lint`, the planned zizmor + vuln-scan jobs from F15.
+- Disallow force-push and deletion.
+- Enforce linear history (no merge commits that bypass required checks via rebase races).
+- Enable **tag protection rules** for `v*` and `node-sdk/v*.*.*` so only admins can create release tags (cross-ref F2).
+
+**F28 — No CODEOWNERS** (medium)
+
+`find` for `CODEOWNERS` returns nothing. Without it, no path-specific mandatory reviewer exists — so a workflow tweak, a `.goreleaser.yml` edit, a `cmd/skill_*.md` rewrite, or a change under `internal/{crypto,ca,auth,oauth,session}` can be approved by any contributor with review rights. Given the project's trust model (credential broker, root-CA key material), some paths should require named security-competent reviewers.
+
+**Recommendation:** add a `CODEOWNERS` at repo root covering at minimum:
+```
+# Release + CI
+/.github/                          @security-team @release-maintainers
+/.goreleaser.yml                   @security-team @release-maintainers
+/Dockerfile                        @security-team
+/Dockerfile.goreleaser             @security-team
+/install.sh                        @security-team
+/scripts/docker-entrypoint.sh      @security-team
+
+# Crypto & auth cores
+/internal/crypto/                  @security-team
+/internal/ca/                      @security-team
+/internal/auth/                    @security-team
+/internal/oauth/                   @security-team
+/internal/session/                 @security-team
+
+# Agent-facing contract (embedded)
+/cmd/skill_cli.md                  @security-team @agent-contract-owners
+/cmd/skill_http.md                 @security-team @agent-contract-owners
+/cmd/run.go                        @security-team
+/internal/server/persistent_instructions_admin.txt @security-team
+```
+Replace team handles with whatever the Infisical org uses.
+
+**F29 — No signed-commit / DCO enforcement** (low, informational)
+
+No DCO bot workflow, no `.github/workflows/dco.yml`, no `CONTRIBUTING.md` mention of signing. Not a strict requirement, but when combined with F27 (no branch protection) and F28 (no CODEOWNERS), it weakens the evidence chain on *who produced a given commit*. For a security-sensitive project, consider requiring signed commits (`git commit -S`) on `main` via branch protection.
+
+**F30 — `GO_RELEASER_GITHUB_TOKEN` is likely a PAT with cross-repo scope** (medium, out-of-repo)
+
+`release.yml:60` passes `GO_RELEASER_GITHUB_TOKEN` as `HOMEBREW_TAP_TOKEN` to goreleaser, per the (currently commented-out) `brews:` block in `.goreleaser.yml`. This is a PAT that needs write access to `Infisical/homebrew-get-cli` — i.e., a *different* repo than the workflow runs in. The default `GITHUB_TOKEN` can't reach that repo, hence the PAT.
+
+Risks:
+- Classic PATs are scoped per-user; if the owning account is compromised, so is the Homebrew tap.
+- Classic PATs typically have wider scope than the one repo they're used for (reading all private repos, for example).
+- Fine-grained PATs (introduced in 2022) can be scoped to a single repo but still live on a user account.
+
+**Recommendation:** migrate to a **GitHub App** installation with `contents: write` on `Infisical/homebrew-get-cli` only. The App installation token is per-workflow-run, short-lived, and not tied to a human account. Alternatively, verify the current token is a fine-grained PAT scoped to that single repo and held on a machine account with SSO + 2FA.
+
+**F31 — No secret-scanning tooling in-repo** (low)
+
+No `gitleaks`, `trufflehog`, or `detect-secrets` config; no pre-commit hook wiring; no secret-scan workflow. GitHub's native **Secret Scanning + Push Protection** can cover this from the settings side — assume off until verified on upstream. Adding `gitleaks-action` (or enabling the native product) is a cheap pre-commit safety net that pairs nicely with `.gitignore`'s file-pattern blocks.
+
+**Recommendation:** verify GitHub Secret Scanning is enabled on upstream; add `zricethezav/gitleaks-action` to CI as a pre-merge check.
+
+---
+
+### Section 6 — Project-specific sensitive paths
+
+**F32 — Sensitive-internal tests run in fork-PR CI** (low, mitigated)
+
+`internal/{crypto,ca,auth,oauth,session}/*_test.go` all run under the `test:` job in `ci.yml` on `pull_request` events, including fork PRs. An attacker submitting a fork PR with a malicious test could execute arbitrary Go code on the runner.
+
+**Mitigation in current state:** `ci.yml` has `permissions: contents: read`, no secrets attached, no artifact uploads that feed privileged workflows (verified in Section 1). A malicious fork PR runs code on a throwaway runner with no credentials worth stealing. Risk is low.
+
+**Residual:** a malicious test could still abuse the runner's network egress (crypto-mining, attacks on external services). StepSecurity Harden-Runner (already tracked as follow-up) closes this — *that follow-up item now covers this finding explicitly*.
+
+**F33 — Skill doc tamper path (agent trust surface)** (medium)
+
+`cmd/run.go:23-26`:
+```go
+//go:embed skill_cli.md
+...
+//go:embed skill_http.md
+```
+These are embedded into the binary and served publicly at `/v1/skills/{cli,http}` (per CLAUDE.md). Agents (Claude Code, Cursor) fetch them as the authoritative how-to-use-Agent-Vault contract — and then *act on their contents*. A malicious revision of either file could:
+- Instruct agents to send credentials to an attacker-controlled endpoint.
+- Describe a "test command" that exfiltrates the vault.
+- Subtly change the agent's mental model so it chooses insecure defaults.
+
+Because the content is trusted *by agents, not users*, the XSS-style review heuristics don't apply — a maintainer reviewing a skill-docs PR is checking for correctness, not necessarily for prompt-injection payloads. Classic lunar-lander problem.
+
+**Mitigation today:** None code-side. Relies entirely on PR review. With F27 + F28 gaps, a single compromised contributor can ship this.
+
+**Recommendation:**
+- **CODEOWNERS** entries on `cmd/skill_*.md` requiring security review (covered by F28 proposal above).
+- **Wire up `skills-lock.json` (F17 option b):** store the sha256 of each embedded skill doc in the lockfile; fail `make build` if the embed drifts from the lockfile without an explicit lockfile update in the same PR. Makes tampering a two-file diff (easier to spot in review) and gives reviewers a clear "integrity changed" signal.
+- Consider serving skill docs with an in-binary signature the agent can verify (e.g., the build attests the skill content; the agent checks a public key). Heavy for the current scale — probably future work.
+
+**F34 — Frontend supply chain reaches the Go binary via `go:embed all:webdist`** (medium, largest indirect surface)
+
+`internal/server/server.go:30`:
+```go
+//go:embed all:webdist
+```
+The `web/` build output is embedded into the binary and served as the admin UI. A compromise at any of these points lands JS in every installed Agent Vault:
+- Any dep in `web/package-lock.json` (or their transitives).
+- A PR that modifies `web/src/` or `web/package.json`.
+- A compromised `vite`/`@tanstack/react-router`/`react` or a typo-squatted dependency.
+- The `esbuild` / `fsevents` install-script binaries (F18) executed during the frontend build.
+
+The admin UI handles session cookies, proposal review (which approves credential changes), and direct credential CRUD. Injected JS in this UI can exfiltrate vault contents or approve malicious proposals.
+
+**Mitigation today:**
+- `web/` has Dependabot coverage (F16 would add `sdks/sdk-typescript` too).
+- CI builds the frontend (`npm ci && npm run build`) — catches build-time errors but not malicious behaviour.
+
+**Recommendation (layered):**
+- **CODEOWNERS** on `web/` (covered by F28).
+- **osv-scanner** on `web/package-lock.json` in CI (F15).
+- **Content-Security-Policy** on the admin UI response headers — strict `script-src 'self'`, no `unsafe-inline`, no third-party domains. Limits what injected JS can do even if it gets in. (This is server-side code review, slightly outside the workflow-audit scope, but flagging here.)
+- **Socket Firewall Free** on the `npm ci` step for `web/` (already tracked as a follow-up) blocks install-time egress from malicious transitive deps.
+- Consider pinning esbuild to a specific version with `--save-exact` so post-install binary-fetching is at least deterministic.
+
+**F35 — Other `go:embed`ed content (lower stakes but real)** (informational)
+
+Inventory from `grep //go:embed cmd/ internal/`:
+- `internal/server/persistent_instructions_admin.txt` — agent-facing admin instructions. **Same threat model as F33** (agents act on it). Should be in CODEOWNERS.
+- `internal/server/*_email.html` (invite, proposal-notification, verification-code, password-reset, test) — HTML email templates. Tamper path → phishing-shaped emails from compromised binaries. Stored-XSS-adjacent if a client renders HTML.
+- `internal/store/migrations/*.sql` — SQL migrations. A malicious migration runs with DB privileges on every upgrade. Integrity gated only by code review.
+- `internal/sandbox/assets/{Dockerfile,init-firewall.sh,entrypoint.sh}` — used by `vault run --sandbox container`. Compromised content runs inside user sandboxes; `init-firewall.sh` sets iptables egress rules — a subtly-broken version could leak traffic past the broker.
+
+**Recommendation:** extend F28's CODEOWNERS proposal to cover each of these (email templates, SQL migrations, sandbox assets). All are embedded-content tamper paths to a trusted binary; all deserve the same PR-review discipline as the crypto internals.
+
+---
+
 ## Newly added tasks
 
 - [ ] Verify tag protection rules on `v*` and `node-sdk/v*.*.*` (repo setting — may need to ask user; cross-ref F2)
@@ -480,6 +680,9 @@ curl --proto '=https' --proto-redir '=https' -fsSL ...
 - [ ] Verify `agent-vault.dev` / `get.agent-vault.dev` infrastructure (F24): DNSSEC, CAA records, HSTS preload, source-of-truth for the served `install.sh` (ideally an in-repo file at a pinned commit, not a mutable bucket).
 - [ ] Once F20 lands, update README's install instructions to reflect the verification step + mention the optional cosign path.
 - [ ] Consider offering a verification-only mode (`install.sh --verify-only`) and a per-platform install via Homebrew / a signed `.pkg` for macOS / `apt` repo for Debian — as alternatives to `curl | sh` for security-conscious users.
+- [ ] Verify **upstream** `Infisical/agent-vault` branch + tag protection settings (F27 is phrased against the `gregclermont/agent-vault` mirror that this session has MCP access to). Re-check on upstream before treating F27 as actionable.
+- [ ] Add Content-Security-Policy headers to the admin UI response (F34 defence-in-depth). Out of scope for workflow-audit but logged here so it isn't lost.
+- [ ] Review `internal/store/migrations/*.sql` review discipline: migrations run with DB privs on every upgrade (F35). Consider signed migrations or a migration-review CODEOWNERS entry.
 - [ ] Consider adding runner-level egress / install-time controls to workflows:
   - **StepSecurity Harden-Runner (Community tier)** — `step-security/harden-runner@<sha>` as the first step of every job. Monitors/restricts outbound network from the runner, detects compromised actions exfiltrating data, and records a runtime SBOM of all egress. Free for public repos. High signal for the supply-chain threat model here (credential broker with cosign keys + Docker Hub token on the runner).
   - **Socket Firewall Free (`sfw`)** — wrap `npm ci` / `npm install` steps (particularly in `release-node-sdk.yml` and the `web/` / `sdks/sdk-typescript/` installs in `ci.yml`) so malicious install-script behaviour from compromised transitive deps is blocked before reaching the network. Complements F18 (esbuild/fsevents postinstall binary fetches).
