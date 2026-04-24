@@ -698,28 +698,42 @@ Post-audit probe of publicly-observable release artifacts. Sandbox egress is res
 
 Also: `:latest` IS being published and overwritten per release (confirms F12's description of the mutable-by-design behaviour).
 
-**`agent-vault.dev` / `get.agent-vault.dev` — partially verified off-sandbox**
+**`agent-vault.dev` / `get.agent-vault.dev` — fully verified off-sandbox**
 
-Off-sandbox run of the four-command probe (ISP resolver is NextDNS):
+Off-sandbox probe (after allowlisting the domain from the user's NRD-blocking resolver):
 
 | Check | Result | Interpretation |
 |---|---|---|
-| `dig +dnssec agent-vault.dev NS DS` | CNAME `blockpage.nextdns.io` — "Blocked by NextDNS: `nrd~month`" | **Domain is <1 month old** per NextDNS's Newly-Registered-Domains list. DNSSEC/NS/DS couldn't be read from this resolver. |
-| `dig CAA agent-vault.dev` | Same NRD block | Couldn't be read from this resolver. |
-| `curl -sI https://get.agent-vault.dev/` → grep STS | Empty | Ambiguous — likely also NRD-blocked at the DNS layer, so curl hit the block page (which wouldn't carry HSTS). Re-run from a non-filtering resolver needed to confirm real STS header presence. |
-| `curl ... hstspreload.org/api/v2/status?domain=agent-vault.dev` → `.status` | `"preloaded"` | **✅ Strong finding.** `agent-vault.dev` is in the HSTS preload list shipped with Chrome/Firefox/Safari/Edge. Browsers refuse HTTP to this domain before ever receiving a header. Best-case HSTS posture for browser clients. |
+| `dig +dnssec agent-vault.dev NS` | `michelle.ns.cloudflare.com.`, `bryce.ns.cloudflare.com.` | Cloudflare-hosted zone. |
+| `dig +dnssec agent-vault.dev DS` | Empty ANSWER; AUTHORITY contains signed NSEC3 proof of non-existence (from `dev.` zone), `ad` flag set on response. | **DNSSEC is NOT enabled on the zone** — the `dev.` TLD is signed, but `agent-vault.dev` has no DS record. No chain of trust to the TLD. |
+| `dig CAA agent-vault.dev` | Empty ANSWER | **No CAA records.** Any public CA can issue a cert for `*.agent-vault.dev`. |
+| `curl -sI https://get.agent-vault.dev/` | `HTTP/2 200`, `content-type: text/x-shellscript`, `server: cloudflare`, `cache-control: public, max-age=300`. No `Strict-Transport-Security`, no `X-Content-Type-Options`, no CSP, no `X-Frame-Options`. | Script served directly from Cloudflare edge. No security response headers. |
+| `hstspreload.org api → .status` | `"preloaded"` | Already confirmed on prior run. |
 
-**Two new findings from this probe, folded into F24:**
+**Findings from the probe (folded under F24):**
 
-- **F24a (positive)** — HSTS preload is active. Remove the "verify HSTS preload" sub-item from F24; it's done.
-- **F24b (informational)** — the installer domain is brand-new (NextDNS flagged it as `nrd~month`). Two operational implications:
-  1. Enterprises with NRD-blocking DNS (NextDNS, DNSFilter, Cisco Umbrella, corporate malware-domain lists) will actively *block* `curl | sh` installs for the first 30-90 days. Documentation should mention a non-`curl|sh` fallback for those environments (dovetails with the "signed install alternatives" follow-up already logged).
-  2. As the domain ages out of NRD lists, this self-resolves — but that window is *now* for the audit.
+- **F24a (positive)** — HSTS preload is active. Covers browser traffic.
+- **F24b (info)** — Domain is <1 month old; NRD filters block `curl | sh` in enterprise networks.
+- **F24c (new, medium)** — **DNSSEC not enabled on `agent-vault.dev`.** For an install-path domain that's the root of trust for `curl | sh`, an unsigned zone means DNS-layer redirection attacks (nameserver compromise, registrar account takeover, cache poisoning against non-validating resolvers, BGP hijack + fake NS response) have no cryptographic defence. Recommend enabling DNSSEC signing on the zone (Cloudflare offers this as a one-click feature) and filing a DS record with the `dev.` registry.
+- **F24d (new, medium)** — **No CAA records.** A single CA compromise → valid cert for `agent-vault.dev` → combined with DNS redirection (F24c), full MITM on the installer. Recommend adding CAA pinning the specific CA currently in use. Minimal example:
+  ```
+  agent-vault.dev.   IN  CAA  0 issue "letsencrypt.org"
+  agent-vault.dev.   IN  CAA  0 issuewild "letsencrypt.org"
+  agent-vault.dev.   IN  CAA  0 iodef "mailto:security@infisical.com"
+  ```
+  (Replace `letsencrypt.org` with whichever CA currently issues — verify with `openssl s_client -connect get.agent-vault.dev:443 -servername get.agent-vault.dev </dev/null 2>/dev/null | openssl x509 -noout -issuer`.)
+- **F24e (new, low)** — **No runtime `Strict-Transport-Security` header** on `https://get.agent-vault.dev/`. Preload covers browsers so no downgrade window exists for them, and `curl | sh` installers don't consult HSTS anyway. But: Chrome's preload listing policy requires preloaded hosts to continue serving a valid STS header (`max-age ≥ 31536000; includeSubDomains; preload`); missing the header is a compliance violation and Chrome can drop domains that stop sending it. Add the header in the Cloudflare page rule / Workers response.
+- **F24f (new, info)** — **No other security response headers** (no `X-Content-Type-Options: nosniff`, no CSP, no `X-Frame-Options`). Low practical impact for a shell-script endpoint but trivial to add via Cloudflare transform rules.
+- **F24g (new, info)** — **Install script is served from Cloudflare edge.** Whoever holds the Cloudflare account for the `agent-vault.dev` zone can replace the served `install.sh` without going through the GitHub repo. Cloudflare account hygiene (hardware-key 2FA, audit log review, minimum-access seat roles) is now part of the install-path TCB. Verify:
+  - Cloudflare account uses hardware-key 2FA (not TOTP alone).
+  - Zone-level API tokens, if any, are scoped per-zone and per-action.
+  - The Cloudflare Worker / Pages project / R2 bucket / static-site config that serves `install.sh` is deployed from an in-repo source at a pinned commit (e.g., via a GitHub Action with its own SHA-pinned deploy workflow) — not edited ad-hoc through the dashboard.
 
-Still open (needs a non-NRD-filtering resolver — e.g., `dig @1.1.1.1 ...`):
-- DNSSEC (`+dnssec`) AD-flag + chain verification
-- CAA records (any issuer pinning?)
-- Runtime STS header on `get.agent-vault.dev/` (relevant for non-browser installers like `curl | sh` that don't consult the preload list)
+Re-checking cert issuer for F24d remains one small open item:
+```sh
+openssl s_client -connect get.agent-vault.dev:443 -servername get.agent-vault.dev </dev/null 2>/dev/null \
+  | openssl x509 -noout -issuer -subject -dates -ext subjectAltName
+```
 
 ---
 
@@ -732,8 +746,13 @@ Still open (needs a non-NRD-filtering resolver — e.g., `dig @1.1.1.1 ...`):
 - [ ] Investigate `Dockerfile:21` — `COPY --from=frontend /internal/server/webdist ...` looks like it copies from an absolute path in the frontend stage that doesn't exist (WORKDIR is `/app`). Likely a latent build-correctness bug, out of scope for security but worth flagging separately.
 - [ ] Decide resolution for F17 `skills-lock.json` — either delete or wire up the integrity check in `make build`.
 - [ ] Once F15 lands, decide fail-threshold policy for vuln scanners (hard-fail on high/critical vs advisory comments on PRs).
-- [~] Verify `agent-vault.dev` / `get.agent-vault.dev` infrastructure (F24). **HSTS preload: confirmed active (F24a).** Still open: DNSSEC chain + CAA records + runtime STS header (retry via `dig @1.1.1.1` / `dig @8.8.8.8` to bypass the NRD filter that blocked the first attempt), plus the source-of-truth for the served `install.sh` (ideally an in-repo file at a pinned commit).
-- [ ] **F24b (new, informational)** — `agent-vault.dev` is a Newly-Registered Domain per NextDNS (<1 month old as of 2026-04-24). Corporate NRD-blocking resolvers will block `curl | sh` installs for 30-90 days. Offer a non-curl-pipe alternative in the meantime (pairs with the "signed install alternatives" follow-up).
+- [x] Verify `agent-vault.dev` / `get.agent-vault.dev` infrastructure (F24). **Done via off-sandbox probe.** Split into 7 sub-findings (F24a-g): F24a HSTS preload active (positive), F24b NRD window (info), F24c DNSSEC disabled (medium), F24d no CAA records (medium), F24e no runtime STS header (low, preload-policy compliance), F24f no other security response headers (info), F24g install.sh served from Cloudflare edge → Cloudflare account is now TCB (info). Only remaining probe: confirm cert issuer for F24d's CAA policy — `openssl s_client ... | openssl x509 -issuer`.
+- [ ] **F24b** — `agent-vault.dev` is a Newly-Registered Domain (<1 month old as of 2026-04-24). Corporate NRD-blocking resolvers will block `curl | sh` installs for 30-90 days. Offer a non-curl-pipe alternative (pairs with the "signed install alternatives" follow-up).
+- [ ] **F24c** — Enable DNSSEC on the `agent-vault.dev` zone (Cloudflare one-click) + file DS at registrar.
+- [ ] **F24d** — Add CAA records pinning the current issuer (verify with `openssl s_client` before committing the record).
+- [ ] **F24e** — Add `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload` header at the Cloudflare edge to stay compliant with the preload listing.
+- [ ] **F24f** — Add the rest of the standard security response headers at the Cloudflare edge: `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy: ...` (minimal), and a CSP that's meaningful for a shell-script endpoint (or `Content-Security-Policy: default-src 'none'` is safe here).
+- [ ] **F24g** — Verify Cloudflare account hygiene for the `agent-vault.dev` zone: hardware-key 2FA, scoped API tokens, and that whatever serves `install.sh` (Worker / Pages / R2 / static site) deploys from an in-repo source at a pinned commit.
 - [ ] Once F20 lands, update README's install instructions to reflect the verification step + mention the optional cosign path.
 - [ ] Consider offering a verification-only mode (`install.sh --verify-only`) and a per-platform install via Homebrew / a signed `.pkg` for macOS / `apt` repo for Debian — as alternatives to `curl | sh` for security-conscious users.
 - [ ] Verify **upstream** `Infisical/agent-vault` branch + tag protection settings (F27 is phrased against the `gregclermont/agent-vault` mirror that this session has MCP access to). Re-check on upstream before treating F27 as actionable.
