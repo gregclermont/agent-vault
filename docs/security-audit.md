@@ -21,8 +21,8 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` finding · `[-]` 
 | F6 | medium | supply-chain | Missing Dependabot `cooldown:` on all ecosystems |
 | F7 | low | workflow | Cache poisoning risk from shared language caches |
 | F8 | low | workflow | `actions/checkout` default `persist-credentials: true` |
-| F9 | **high** | release | Docker images are not cosign-signed |
-| F10 | medium | release | No SBOM attached to Docker images |
+| F9 | **high** | release | Docker images are not cosign-signed *(empirically confirmed via registry probe)* |
+| F10 | medium | release | No SBOM attached to Docker images *(empirically confirmed via registry probe)* |
 | F11 | medium | release | No SLSA build provenance attestation |
 | F12 | low | release | `:latest` tag is mutable (by design; document) |
 | F13 | low | release | Cosign verify regex is too broad |
@@ -664,20 +664,64 @@ Inventory from `grep //go:embed cmd/ internal/`:
 
 **Recommendation:** extend F28's CODEOWNERS proposal to cover each of these (email templates, SQL migrations, sandbox assets). All are embedded-content tamper paths to a trusted binary; all deserve the same PR-review discipline as the crypto internals.
 
----
+### External verification (public endpoints, read-only)
 
-## Newly added tasks
+Post-audit probe of publicly-observable release artifacts. Sandbox egress is restricted to an allowlist (no DoH providers, no `agent-vault.dev`), so DNS/TLS/HSTS checks for the installer domain could not be completed from this environment — logged as still-open.
+
+**npm: `@infisical/agent-vault-sdk` trusted-publisher scoping — FULLY CONFIRMED**
+
+`GET https://registry.npmjs.org/@infisical/agent-vault-sdk` returns:
+- Versions shipped: `0.1.0`, `0.1.1`. Latest dist-tag: `0.1.1`.
+- Publisher: `GitHub Actions <npm-oidc-no-reply@github.com>` with `trustedPublisher: {id: "github", oidcConfigId: "oidc:201c5e73-..."}` — i.e., no personal/token publisher; only the trusted-publisher flow can push.
+- Each version has both npm's publish-attestation and a **SLSA provenance v1** attestation.
+- SLSA provenance payload (decoded from `registry.npmjs.org/-/npm/v1/attestations/...`) binds release `0.1.1` to:
+  ```
+  workflow.repository = https://github.com/Infisical/agent-vault
+  workflow.path       = .github/workflows/release-node-sdk.yml
+  workflow.ref        = refs/tags/node-sdk/v0.1.1
+  buildType           = slsa-framework.github.io/github-actions-buildtypes/workflow/v1
+  ```
+
+**Verdict:** exactly the scoping the audit asked for. Follow-up closed.
+
+**Docker Hub: `infisical/agent-vault` — F9 and F10 EMPIRICALLY CONFIRMED**
+
+`GET hub.docker.com/v2/repositories/infisical/agent-vault/`:
+- Repo is public, active, `last_updated: 2026-04-23`, `pull_count: 999`.
+
+`GET registry-1.docker.io/v2/infisical/agent-vault/tags/list` (authenticated via anonymous pull token):
+- **40 tags total** covering versions `0.3.0` through `0.10.0` — per-arch tags (`-amd64`, `-arm64`) plus multi-arch manifest list tags and `latest`.
+- **0 cosign signature tags** (cosign publishes sigs as sibling tags `sha256-<digest>.sig` — none exist).
+- **0 SBOM tags** (`sha256-<digest>.sbom` — none exist).
+
+**Verdict:** the published registry empirically confirms F9 (no image signing) and F10 (no image SBOM attached). Not speculation — it's the observable state of all 10 shipped versions.
+
+Also: `:latest` IS being published and overwritten per release (confirms F12's description of the mutable-by-design behaviour).
+
+**`agent-vault.dev` / `get.agent-vault.dev` — BLOCKED by sandbox egress**
+
+Attempted DoH against `cloudflare-dns.com` (CAA, DS, NS) → 403 from sandbox egress filter. Direct HTTPS to `agent-vault.dev` → host doesn't resolve via sandbox DNS (though `get.agent-vault.dev` does, via TLS-inspecting proxy). HSTS-preload API (`hstspreload.org`) → 403. **Could not verify DNSSEC, CAA records, HSTS preload status, or HSTS headers from this environment.**
+
+These checks remain open — a single command outside the sandbox would close them:
+```sh
+dig +dnssec agent-vault.dev NS DS
+dig CAA agent-vault.dev
+curl -sI https://get.agent-vault.dev/ | grep -i strict-transport-security
+curl -s 'https://hstspreload.org/api/v2/status?domain=agent-vault.dev' | jq .status
+```
+
+---
 
 - [ ] Verify tag protection rules on `v*` and `node-sdk/v*.*.*` (repo setting — may need to ask user; cross-ref F2)
 - [ ] Audit the floating `version: "~> v2"` on goreleaser-action + `version: v2.11` on golangci-lint-action — consider pinning the tool binary too (low prio)
 - [ ] Consider adding zizmor to CI as a recurring check (uv tool install zizmor; run against `.github/`)
 - [x] Generalise F6: audit **every** package/dependency manager config in the repo for cooldown / delay settings, not just Dependabot. **Resolved:** executed `find` for Renovate (`renovate.json` / `.renovaterc*`), `.npmrc`, `tools.go`, `.pre-commit-config.yaml`, Mergify, auto-merge — none present. Dependabot is the only dep-manager config in the repo, so F6's cooldown fix is the complete remediation. Re-run this check if Renovate is ever introduced.
 - [ ] Verify Docker Hub repository settings: tag immutability on versioned tags, two-factor auth on the publishing account, scoped access token for `DOCKERHUB_TOKEN` (repo:write on `infisical/agent-vault` only) — cross-ref F12
-- [ ] Confirm npmjs trusted-publisher config for `@infisical/agent-vault-sdk` is scoped to `.github/workflows/release-node-sdk.yml` on this repo only
+- [x] Confirm npmjs trusted-publisher config for `@infisical/agent-vault-sdk` is scoped to `.github/workflows/release-node-sdk.yml` on this repo only. **Resolved via registry probe** — see *External verification* section. Trusted publisher + SLSA provenance v1 both confirm scoping to `Infisical/agent-vault` / `release-node-sdk.yml` / `refs/tags/node-sdk/v0.1.1`.
 - [ ] Investigate `Dockerfile:21` — `COPY --from=frontend /internal/server/webdist ...` looks like it copies from an absolute path in the frontend stage that doesn't exist (WORKDIR is `/app`). Likely a latent build-correctness bug, out of scope for security but worth flagging separately.
 - [ ] Decide resolution for F17 `skills-lock.json` — either delete or wire up the integrity check in `make build`.
 - [ ] Once F15 lands, decide fail-threshold policy for vuln scanners (hard-fail on high/critical vs advisory comments on PRs).
-- [ ] Verify `agent-vault.dev` / `get.agent-vault.dev` infrastructure (F24): DNSSEC, CAA records, HSTS preload, source-of-truth for the served `install.sh` (ideally an in-repo file at a pinned commit, not a mutable bucket).
+- [ ] Verify `agent-vault.dev` / `get.agent-vault.dev` infrastructure (F24): DNSSEC, CAA records, HSTS preload, source-of-truth for the served `install.sh` (ideally an in-repo file at a pinned commit, not a mutable bucket). *(Attempted from this session's sandbox — blocked by egress allowlist. Commands to run outside the sandbox are in the "External verification" section.)*
 - [ ] Once F20 lands, update README's install instructions to reflect the verification step + mention the optional cosign path.
 - [ ] Consider offering a verification-only mode (`install.sh --verify-only`) and a per-platform install via Homebrew / a signed `.pkg` for macOS / `apt` repo for Debian — as alternatives to `curl | sh` for security-conscious users.
 - [ ] Verify **upstream** `Infisical/agent-vault` branch + tag protection settings (F27 is phrased against the `gregclermont/agent-vault` mirror that this session has MCP access to). Re-check on upstream before treating F27 as actionable.
